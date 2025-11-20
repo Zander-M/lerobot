@@ -72,15 +72,20 @@ def add_lora_to_gemma(policy: "PI05IMLELoRAPolicy") -> None:
         p.requires_grad = False
     paligemma.vision_tower.eval()
 
-    target_modules = [
-        "q_proj",
-        "k_proj",
-        "v_proj",
-        "o_proj",
-        "gate_proj",
-        "up_proj",
-        "down_proj",
-    ]
+    # Finding LoRA modules in language model
+    proj_names = ["q_proj", "k_proj", "v_proj", "o_proj",
+              "gate_proj", "up_proj", "down_proj"]
+
+    def find_llm_modules(model, proj):
+        return [
+            name
+            for name, module in model.named_modules()
+            if name.endswith(proj) and "language_model" in name
+        ]
+
+    target_modules = [leaf 
+                      for proj in proj_names
+                      for leaf in find_llm_modules(paligemma, proj)]
 
     lora_cfg = LoraConfig(
         r=cfg.lora_r,
