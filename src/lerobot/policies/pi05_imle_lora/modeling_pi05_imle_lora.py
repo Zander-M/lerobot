@@ -55,7 +55,7 @@ from lerobot.utils.constants import (
 
 def add_lora_to_gemma(policy: "PI05IMLELoRAPolicy") -> None:
     """
-        Wrapping Gemma model with LoRA
+        Wrapping Gemma model with LoRA. We only finetune the text Gemma model with LoRA
     """
     cfg = policy.config
 
@@ -65,7 +65,12 @@ def add_lora_to_gemma(policy: "PI05IMLELoRAPolicy") -> None:
     if cfg.lora_target != "language":
         raise NotImplementedError(f"Unsupported lora_target={cfg.lora_target}; only 'language' is handled.")
 
-    gemma_llm = policy.model.paligemma_with_expert.paligemma.model.language_model
+    paligemma = policy.model.paligemma_with_expert.paligemma
+
+    # Freeze vision tower; we only finetune the language stack.
+    for p in paligemma.vision_tower.parameters():
+        p.requires_grad = False
+    paligemma.vision_tower.eval()
 
     target_modules = [
         "q_proj",
@@ -86,29 +91,11 @@ def add_lora_to_gemma(policy: "PI05IMLELoRAPolicy") -> None:
         task_type="CAUSAL_LM",
     )
 
-    if not hasattr(gemma_llm, "prepare_inputs_for_generation"):
-        # PEFT expects the base model to define this hook; GemmaModel does not.
-        # Provide a minimal pass-through to keep generate-compatible paths happy.
-        def _prepare_inputs_for_generation(self, input_ids, past_key_values=None, attention_mask=None, **kwargs):
-            model_inputs = {"input_ids": input_ids}
-            if past_key_values is not None:
-                model_inputs["past_key_values"] = past_key_values
-            if attention_mask is not None:
-                model_inputs["attention_mask"] = attention_mask
-            model_inputs.update(kwargs)
-            return model_inputs
+    paligemma = get_peft_model(paligemma, lora_cfg)
+    paligemma.enable_input_require_grads()
+    policy.model.paligemma_with_expert.paligemma = paligemma
 
-        gemma_llm.prepare_inputs_for_generation = _prepare_inputs_for_generation.__get__(gemma_llm, type(gemma_llm))
-
-    gemma_llm = get_peft_model(gemma_llm, lora_cfg)
-    if not hasattr(gemma_llm, "prepare_inputs_for_generation") and hasattr(
-        gemma_llm.base_model, "prepare_inputs_for_generation"
-    ):
-        gemma_llm.prepare_inputs_for_generation = gemma_llm.base_model.prepare_inputs_for_generation
-    gemma_llm.enable_input_require_grads()
-    policy.model.paligemma_with_expert.paligemma.model.language_model = gemma_llm
-
-    print_lora_parameter_stats(gemma_llm)
+    print_lora_parameter_stats(paligemma)
 
 def print_lora_parameter_stats(model: nn.Module):
     """

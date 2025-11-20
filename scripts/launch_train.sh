@@ -18,6 +18,7 @@ conda run --no-capture-output -n lerobot lerobot-train\
   --policy.dtype=bfloat16 \
   --policy.gradient_checkpointing=true \
   --policy.device=cuda \
+  --policy.use_lora=true \
   --batch_size=1 \
   --policy.chunk_size=8 --policy.n_action_steps=8 \
   --steps 10 --log_freq 1  # tiny smoke run
