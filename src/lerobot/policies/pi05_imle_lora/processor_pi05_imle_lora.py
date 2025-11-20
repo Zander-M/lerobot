@@ -22,8 +22,8 @@ import numpy as np
 import torch
 
 from lerobot.configs.types import PipelineFeatureType, PolicyFeature
-from lerobot.policies.pi05.configuration_pi05 import PI05Config
 from lerobot.policies.pi05.modeling_pi05 import pad_vector
+from lerobot.policies.pi05_imle_lora.configuration_pi05_imle_lora import PI05IMLELoRAConfig
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
     DeviceProcessorStep,
@@ -45,9 +45,9 @@ from lerobot.utils.constants import (
 )
 
 
-@ProcessorStepRegistry.register(name="pi05_prepare_state_tokenizer_processor_step")
+@ProcessorStepRegistry.register(name="pi05_imle_lora_prepare_state_tokenizer_processor_step")
 @dataclass
-class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
+class Pi05IMLELoRAPrepareStateTokenizerProcessorStep(ProcessorStep):
     """
     Processor step to prepare the state and tokenize the language input.
     """
@@ -98,14 +98,14 @@ class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
 
 
 def make_pi05_pre_post_processors(
-    config: PI05Config,
+    config: PI05IMLELoRAConfig,
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
 ) -> tuple[
     PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     PolicyProcessorPipeline[PolicyAction, PolicyAction],
 ]:
     """
-    Constructs pre-processor and post-processor pipelines for the PI0 policy.
+    Constructs pre-processor and post-processor pipelines for the PI05 IMLE policy.
 
     The pre-processing pipeline prepares input data for the model by:
     1. Renaming features to match pretrained configurations.
@@ -120,7 +120,7 @@ def make_pi05_pre_post_processors(
     2. Unnormalizing the output features to their original scale.
 
     Args:
-        config: The configuration object for the PI0 policy.
+        config: The configuration object for the PI05 IMLE policy.
         dataset_stats: A dictionary of statistics for normalization.
         preprocessor_kwargs: Additional arguments for the pre-processor pipeline.
         postprocessor_kwargs: Additional arguments for the post-processor pipeline.

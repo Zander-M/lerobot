@@ -14,8 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .configuration_pi05 import PI05Config
-from .modeling_pi05 import PI05Policy
-from .processor_pi05 import make_pi05_pre_post_processors
+from .configuration_pi05_imle_lora import PI05IMLELoRAConfig
+from .modeling_pi05_imle_lora import PI05IMLELoRAPolicy
+from .processor_pi05_imle_lora import make_pi05_pre_post_processors
 
-__all__ = ["PI05Config", "PI05Policy", "make_pi05_pre_post_processors"]
+__all__ = ["PI05IMLELoRAConfig", "PI05IMLELoRAPolicy", "make_pi05_pre_post_processors"]

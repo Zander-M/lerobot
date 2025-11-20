@@ -1,4 +1,4 @@
-$\pi_{0.5}$ + IMLE. 
+$\pi_{0.5}$ + IMLE with LoRA support. 
 
 We finetune the model based on $\pi_{0.5}$ model checkpoint finetuned for LIBERO tasks, and switch the action expert from flow matching to IMLE.
 
