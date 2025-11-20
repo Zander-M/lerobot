@@ -1,3 +1,7 @@
+# Lerobot pi05 with LoRA 
+
+# TODO: switch action expert model to GeneratorConvolution1DUnet as in IMLE Policy
+
 #!/usr/bin/env python
 
 # Copyright 2025 Physical Intelligence and The HuggingFace Inc. team. All rights reserved.
@@ -22,11 +26,11 @@ from lerobot.optim.optimizers import AdamWConfig
 from lerobot.optim.schedulers import CosineDecayWithWarmupSchedulerConfig
 
 
-@PreTrainedConfig.register_subclass("pi05")
+@PreTrainedConfig.register_subclass("pi05_imle_lora")
 @dataclass
-class PI05Config(PreTrainedConfig):
+class PI05IMLELoRAConfig(PreTrainedConfig):
     paligemma_variant: str = "gemma_2b"
-    action_expert_variant: str = "gemma_300m"
+    action_expert_variant: str = "gemma_300m" # TODO switch to IMLE
     dtype: str = "float32"  # Options: "bfloat16", "float32"
 
     n_obs_steps: int = 1
@@ -82,6 +86,13 @@ class PI05Config(PreTrainedConfig):
     scheduler_decay_lr: float = 2.5e-6
 
     tokenizer_max_length: int = 200  # see openpi `__post_init__`
+
+    # LoRA related configs
+    use_lora: bool = False
+    lora_r: int = 16
+    lora_alpha: int = 32
+    lora_dropout: float = 0.05
+    lora_target: str = "language" # use LoRA finetuning for language model only
 
     def __post_init__(self):
         super().__post_init__()

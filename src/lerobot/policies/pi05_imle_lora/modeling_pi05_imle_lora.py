@@ -27,6 +27,8 @@ from torch import Tensor, nn
 
 from lerobot.utils.import_utils import _transformers_available
 
+from peft import LoraConfig, get_peft_model
+
 # Conditional import for type checking and lazy loading
 if TYPE_CHECKING or _transformers_available:
     from transformers.models.auto import CONFIG_MAPPING
@@ -40,7 +42,7 @@ else:
     PaliGemmaForConditionalGeneration = None
 
 from lerobot.configs.policies import PreTrainedConfig
-from lerobot.policies.pi05.configuration_pi05 import PI05Config
+from lerobot.policies.pi05_imle_lora.configuration_pi05_imle_lora import PI05IMLELoRAConfig
 from lerobot.policies.pretrained import PreTrainedPolicy, T
 from lerobot.utils.constants import (
     ACTION,
@@ -49,6 +51,90 @@ from lerobot.utils.constants import (
     OPENPI_ATTENTION_MASK_VALUE,
 )
 
+### LoRA utils
+
+def add_lora_to_gemma(policy: "PI05IMLELoRAPolicy") -> None:
+    """
+        Wrapping Gemma model with LoRA
+    """
+    cfg = policy.config
+
+    if not cfg.use_lora:
+        return
+
+    if cfg.lora_target != "language":
+        raise NotImplementedError(f"Unsupported lora_target={cfg.lora_target}; only 'language' is handled.")
+
+    gemma_llm = policy.model.paligemma_with_expert.paligemma.model.language_model
+
+    target_modules = [
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+    ]
+
+    lora_cfg = LoraConfig(
+        r=cfg.lora_r,
+        lora_alpha=cfg.lora_alpha,
+        lora_dropout=cfg.lora_dropout,
+        bias="none",
+        target_modules=target_modules,
+        task_type="CAUSAL_LM",
+    )
+
+    if not hasattr(gemma_llm, "prepare_inputs_for_generation"):
+        # PEFT expects the base model to define this hook; GemmaModel does not.
+        # Provide a minimal pass-through to keep generate-compatible paths happy.
+        def _prepare_inputs_for_generation(self, input_ids, past_key_values=None, attention_mask=None, **kwargs):
+            model_inputs = {"input_ids": input_ids}
+            if past_key_values is not None:
+                model_inputs["past_key_values"] = past_key_values
+            if attention_mask is not None:
+                model_inputs["attention_mask"] = attention_mask
+            model_inputs.update(kwargs)
+            return model_inputs
+
+        gemma_llm.prepare_inputs_for_generation = _prepare_inputs_for_generation.__get__(gemma_llm, type(gemma_llm))
+
+    gemma_llm = get_peft_model(gemma_llm, lora_cfg)
+    if not hasattr(gemma_llm, "prepare_inputs_for_generation") and hasattr(
+        gemma_llm.base_model, "prepare_inputs_for_generation"
+    ):
+        gemma_llm.prepare_inputs_for_generation = gemma_llm.base_model.prepare_inputs_for_generation
+    gemma_llm.enable_input_require_grads()
+    policy.model.paligemma_with_expert.paligemma.model.language_model = gemma_llm
+
+    print_lora_parameter_stats(gemma_llm)
+
+def print_lora_parameter_stats(model: nn.Module):
+    """
+        Print LoRA parameters
+    """
+    total_params = 0
+    trainable_params = 0
+    lora_params = 0
+
+    for name, param in model.named_parameters():
+        n = param.numel()
+        total_params += n
+        if param.requires_grad:
+            trainable_params += n
+            if "lora_" in name:
+                lora_params += n
+    pct = 100.0 * trainable_params / total_params if total_params > 0 else 0.0
+
+    print("\n==================== LoRA Parameter Report ====================")
+    print(f"Total parameters:            {total_params:,}")
+    print(f"Trainable parameters:        {trainable_params:,}")
+    print(f"   of which LoRA params:     {lora_params:,}")
+    print(f"Percentage trainable:        {pct:.6f}%")
+    print("===============================================================\n")
+
+### PiO5 Model
 
 def get_safe_dtype(target_dtype, device_type):
     """Get a safe dtype for the given device type."""
@@ -499,10 +585,10 @@ class PaliGemmaWithExpertModel(
         return [prefix_output, suffix_output], prefix_past_key_values
 
 
-class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
-    """Core PI05 PyTorch model."""
+class PI05IMLELoRAPytorch(nn.Module):  # see openpi `PI0Pytorch`
+    """Core PI05 PyTorch model + IMLE with LoRA support."""
 
-    def __init__(self, config: PI05Config):
+    def __init__(self, config: PI05IMLELoRAConfig):
         super().__init__()
         self.config = config
 
@@ -820,15 +906,15 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         return self.action_out_proj(suffix_out)
 
 
-class PI05Policy(PreTrainedPolicy):
+class PI05IMLELoRAPolicy(PreTrainedPolicy):
     """PI05 Policy for LeRobot."""
 
-    config_class = PI05Config
-    name = "pi05"
+    config_class = PI05IMLELoRAConfig
+    name = "pi05_imle_lora"
 
     def __init__(
         self,
-        config: PI05Config,
+        config: PI05IMLELoRAConfig,
     ):
         """
         Args:
@@ -839,7 +925,14 @@ class PI05Policy(PreTrainedPolicy):
         self.config = config
 
         # Initialize the core PI05 model
-        self.model = PI05Pytorch(config)
+        self.model = PI05IMLELoRAPytorch(config)
+        self.lora_applied: bool = False
+
+        # When training from scratch, apply LoRA immediately. When loading a pretrained (non-LoRA) checkpoint,
+        # we defer LoRA wrapping until after weights are loaded in from_pretrained to avoid key mismatches.
+        if config.use_lora and not config.pretrained_path:
+            add_lora_to_gemma(self)
+            self.lora_applied = True
 
         # Enable gradient checkpointing if requested
         if config.gradient_checkpointing:
@@ -968,6 +1061,11 @@ class PI05Policy(PreTrainedPolicy):
 
         except Exception as e:
             print(f"Warning: Could not remap state dict keys: {e}")
+
+        # After loading a base (non-LoRA) checkpoint, optionally wrap with LoRA.
+        if config.use_lora and not getattr(model, "lora_applied", False):
+            add_lora_to_gemma(model)
+            model.lora_applied = True
 
         return model
 
