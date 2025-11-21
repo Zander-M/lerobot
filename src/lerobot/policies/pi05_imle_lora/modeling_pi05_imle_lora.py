@@ -71,8 +71,11 @@ def add_lora_to_gemma(policy: "PI05IMLELoRAPolicy") -> None:
     paligemma.vision_tower.eval()
 
     # Finding LoRA modules in language model
-    proj_names = ["q_proj", "k_proj", "v_proj", "o_proj",
-              "gate_proj", "up_proj", "down_proj"]
+
+    # Keep it consistent with the _fix_pytorch_state_dict_keys
+    attn_proj = ["q_proj", "k_proj", "v_proj", "o_proj"]
+    mlp_proj = ["gate_proj", "up_proj", "down_proj"]
+    proj_names = attn_proj + mlp_proj
 
     def find_llm_modules(model, proj):
         return [
@@ -84,7 +87,7 @@ def add_lora_to_gemma(policy: "PI05IMLELoRAPolicy") -> None:
     target_modules = [leaf 
                       for proj in proj_names
                       for leaf in find_llm_modules(paligemma, proj)]
-
+ 
     lora_cfg = LoraConfig(
         r=cfg.lora_r,
         lora_alpha=cfg.lora_alpha,
@@ -927,14 +930,18 @@ class PI05IMLELoRAPolicy(PreTrainedPolicy):
         self.model = PI05IMLELoRAPytorch(config)
         self.lora_applied: bool = False
 
-        # Always wrap with LoRA so LoRA checkpoints load; toggle trainability via use_lora/zero_lora_on_load
+        # Always wrap with LoRA so LoRA checkpoints load; toggle trainability via use_lora
         if not self.lora_applied:
             add_lora_to_gemma(self)
             self.lora_applied = True
 
-        # If use_lora is False, disable adapters and zero them so the model matches the base checkpoint
+        # If use_lora is True, only train LoRA adapters; freeze everything else.
+        if config.use_lora:
+            self._freeze_non_lora_parameters()
+
+        # If use_lora is False, disable adapters so the model matches the base checkpoint
         if not config.use_lora:
-            self._freeze_lora_adapters(zero=True)
+            self._freeze_lora_adapters()
 
         # Enable gradient checkpointing if requested
         if config.gradient_checkpointing:
@@ -944,31 +951,28 @@ class PI05IMLELoRAPolicy(PreTrainedPolicy):
 
         self.reset()
 
-    def _zero_lora_parameters(self) -> None:
-        """Set all LoRA adapter weights to zero to disable their effect."""
-        zeroed = 0
-        for name, param in self.model.named_parameters():
-            if "lora_" in name:
-                param.data.zero_()
-                zeroed += param.numel()
-        logging.info(f"Zeroed {zeroed} LoRA parameters")
+    def _freeze_lora_adapters(self) -> None:
+        """Disable LoRA adapters and freeze the entire model when LoRA is off."""
+        for _, param in self.model.named_parameters():
+            param.requires_grad = False
+        # At runtime, also disable adapter layers to fully bypass LoRA in forward
+        paligemma = getattr(self.model.paligemma_with_expert, "paligemma", None)
+        if paligemma is not None and hasattr(paligemma, "disable_adapter_layers"):
+            paligemma.disable_adapter_layers()
+        logging.info("Disabled LoRA adapters and froze all parameters")
 
-    def _freeze_lora_adapters(self, zero: bool = False) -> None:
-        """Disable LoRA adapters; optionally zero them to recover base model behavior."""
+    def _freeze_non_lora_parameters(self) -> None:
+        """Freeze everything except LoRA adapter parameters."""
         frozen = 0
+        trainable = 0
         for name, param in self.model.named_parameters():
             if "lora_" in name:
-                param.requires_grad = False
-                if zero:
-                    param.data.zero_()
-                frozen += param.numel()
+                param.requires_grad = True
+                trainable += param.numel()
             else:
-                # ensure base weights stay frozen when opting out of LoRA
                 param.requires_grad = False
-        if zero:
-            logging.info(f"Froze and zeroed {frozen} LoRA parameters")
-        else:
-            logging.info(f"Froze {frozen} LoRA parameters")
+                frozen += param.numel()
+        logging.info(f"LoRA-only finetuning: trainable={trainable:,} frozen={frozen:,}")
 
     @classmethod
     def from_pretrained(
@@ -1007,7 +1011,7 @@ class PI05IMLELoRAPolicy(PreTrainedPolicy):
                 local_files_only=local_files_only,
                 revision=revision,
                 **kwargs,
-        )
+            )
 
         # Initialize model without loading weights
         # Check if dataset_stats were provided in kwargs
@@ -1070,7 +1074,7 @@ class PI05IMLELoRAPolicy(PreTrainedPolicy):
             has_lora_in_ckpt = any("lora_" in k for k in remapped_state_dict)
             load_strict = strict
             if config.use_lora and not has_lora_in_ckpt:
-                print("No LoRA keys found in checkpoint; loading with strict=False and zeroing adapters")
+                print("No LoRA keys found in checkpoint; loading with strict=False and adapters")
                 load_strict = False
 
             # Load the remapped state dict into the model
@@ -1098,12 +1102,6 @@ class PI05IMLELoRAPolicy(PreTrainedPolicy):
 
             if not missing_keys and not unexpected_keys:
                 print("All keys loaded successfully!")
-
-            # Optional: zero LoRA adapters to recover base-model behavior for sanity checks.
-            # Also zero when the checkpoint had no LoRA params (adapters are random otherwise).
-            if (config.use_lora and config.zero_lora) or (config.use_lora and not has_lora_in_ckpt):
-                model._zero_lora_parameters()
-                print("Zeroed LoRA adapters on load (via config) to match base model.")
 
         except Exception as e:
             print(f"Warning: Could not remap state dict keys: {e}")
