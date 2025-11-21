@@ -27,6 +27,7 @@ from torch import Tensor, nn
 
 from lerobot.utils.import_utils import _transformers_available
 
+# LoRA related
 from peft import LoraConfig, get_peft_model
 
 # Conditional import for type checking and lazy loading
@@ -58,9 +59,6 @@ def add_lora_to_gemma(policy: "PI05IMLELoRAPolicy") -> None:
         Wrapping Gemma model with LoRA. We only finetune the text Gemma model with LoRA
     """
     cfg = policy.config
-
-    if not cfg.use_lora:
-        return
 
     if cfg.lora_target != "language":
         raise NotImplementedError(f"Unsupported lora_target={cfg.lora_target}; only 'language' is handled.")
@@ -125,6 +123,15 @@ def print_lora_parameter_stats(model: nn.Module):
     print(f"   of which LoRA params:     {lora_params:,}")
     print(f"Percentage trainable:        {pct:.6f}%")
     print("===============================================================\n")
+
+def freeze_paligemma(paligemma: nn.Module):
+    """
+        Freeze PaliGemma if we don't use LoRA finetuning.
+        In this case we only train the IMLE model
+    """
+    for p in paligemma.parameters():
+        p.requires_grad = False
+    paligemma.eval()
 
 ### PiO5 Model
 
@@ -920,11 +927,14 @@ class PI05IMLELoRAPolicy(PreTrainedPolicy):
         self.model = PI05IMLELoRAPytorch(config)
         self.lora_applied: bool = False
 
-        # When training from scratch, apply LoRA immediately. When loading a pretrained (non-LoRA) checkpoint,
-        # we defer LoRA wrapping until after weights are loaded in from_pretrained to avoid key mismatches.
-        if config.use_lora and not config.pretrained_path:
+        # Always wrap with LoRA so LoRA checkpoints load; toggle trainability via use_lora/zero_lora_on_load
+        if not self.lora_applied:
             add_lora_to_gemma(self)
             self.lora_applied = True
+
+        # If use_lora is False, disable adapters and zero them so the model matches the base checkpoint
+        if not config.use_lora:
+            self._freeze_lora_adapters(zero=True)
 
         # Enable gradient checkpointing if requested
         if config.gradient_checkpointing:
@@ -933,6 +943,32 @@ class PI05IMLELoRAPolicy(PreTrainedPolicy):
         self.model.to(config.device)
 
         self.reset()
+
+    def _zero_lora_parameters(self) -> None:
+        """Set all LoRA adapter weights to zero to disable their effect."""
+        zeroed = 0
+        for name, param in self.model.named_parameters():
+            if "lora_" in name:
+                param.data.zero_()
+                zeroed += param.numel()
+        logging.info(f"Zeroed {zeroed} LoRA parameters")
+
+    def _freeze_lora_adapters(self, zero: bool = False) -> None:
+        """Disable LoRA adapters; optionally zero them to recover base model behavior."""
+        frozen = 0
+        for name, param in self.model.named_parameters():
+            if "lora_" in name:
+                param.requires_grad = False
+                if zero:
+                    param.data.zero_()
+                frozen += param.numel()
+            else:
+                # ensure base weights stay frozen when opting out of LoRA
+                param.requires_grad = False
+        if zero:
+            logging.info(f"Froze and zeroed {frozen} LoRA parameters")
+        else:
+            logging.info(f"Froze {frozen} LoRA parameters")
 
     @classmethod
     def from_pretrained(
@@ -971,11 +1007,16 @@ class PI05IMLELoRAPolicy(PreTrainedPolicy):
                 local_files_only=local_files_only,
                 revision=revision,
                 **kwargs,
-            )
+        )
 
         # Initialize model without loading weights
         # Check if dataset_stats were provided in kwargs
         model = cls(config, **kwargs)
+
+        # If we are loading a LoRA checkpoint, make sure adapters exist before loading weights.
+        if config.use_lora and not getattr(model, "lora_applied", False):
+            add_lora_to_gemma(model)
+            model.lora_applied = True
 
         # Now manually load and remap the state dict
         try:
@@ -1025,8 +1066,15 @@ class PI05IMLELoRAPolicy(PreTrainedPolicy):
             if remap_count > 0:
                 print(f"Remapped {remap_count} state dict keys")
 
+            # If checkpoint has no LoRA params but model expects them, relax strict loading
+            has_lora_in_ckpt = any("lora_" in k for k in remapped_state_dict)
+            load_strict = strict
+            if config.use_lora and not has_lora_in_ckpt:
+                print("No LoRA keys found in checkpoint; loading with strict=False and zeroing adapters")
+                load_strict = False
+
             # Load the remapped state dict into the model
-            missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=strict)
+            missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=load_strict)
 
             if missing_keys:
                 print(f"Missing keys when loading state dict: {len(missing_keys)} keys")
@@ -1051,13 +1099,14 @@ class PI05IMLELoRAPolicy(PreTrainedPolicy):
             if not missing_keys and not unexpected_keys:
                 print("All keys loaded successfully!")
 
+            # Optional: zero LoRA adapters to recover base-model behavior for sanity checks.
+            # Also zero when the checkpoint had no LoRA params (adapters are random otherwise).
+            if (config.use_lora and config.zero_lora) or (config.use_lora and not has_lora_in_ckpt):
+                model._zero_lora_parameters()
+                print("Zeroed LoRA adapters on load (via config) to match base model.")
+
         except Exception as e:
             print(f"Warning: Could not remap state dict keys: {e}")
-
-        # After loading a base (non-LoRA) checkpoint, optionally wrap with LoRA.
-        if config.use_lora and not getattr(model, "lora_applied", False):
-            add_lora_to_gemma(model)
-            model.lora_applied = True
 
         return model
 
@@ -1069,16 +1118,17 @@ class PI05IMLELoRAPolicy(PreTrainedPolicy):
 
         fixed_state_dict = {}
 
+        paligemma_prefix_flat = "model.paligemma_with_expert.paligemma.model."
+        paligemma_prefix_nested = "model.paligemma_with_expert.paligemma.base_model.model.model."
+
         for key, value in state_dict.items():
             new_key = key
 
             # Handle layer norm structure changes: .weight -> .dense.weight + .dense.bias
-            # For gemma expert layers
             if re.match(
                 r"paligemma_with_expert\.gemma_expert\.model\.layers\.\d+\.(input_layernorm|post_attention_layernorm)\.weight",
                 key,
             ):
-                # Check if the model actually has adaRMS enabled for the expert
                 expert_uses_adarms = getattr(
                     self.model.paligemma_with_expert.gemma_expert.config, "use_adarms", False
                 )
@@ -1087,7 +1137,6 @@ class PI05IMLELoRAPolicy(PreTrainedPolicy):
                     continue
 
             if re.match(r"paligemma_with_expert\.gemma_expert\.model\.norm\.weight", key):
-                # Check if the model actually has adaRMS enabled for the expert
                 expert_uses_adarms = getattr(
                     self.model.paligemma_with_expert.gemma_expert.config, "use_adarms", False
                 )
@@ -1096,24 +1145,61 @@ class PI05IMLELoRAPolicy(PreTrainedPolicy):
                     continue
 
             # Handle MLP naming changes for pi05
-            # pi05 model expects time_mlp_*, but checkpoint might have action_time_mlp_*
             if key.startswith("action_time_mlp_in."):
                 new_key = key.replace("action_time_mlp_in.", "time_mlp_in.")
             elif key.startswith("action_time_mlp_out."):
                 new_key = key.replace("action_time_mlp_out.", "time_mlp_out.")
-            # Also handle state_proj which shouldn't exist in pi05
             if key.startswith("state_proj."):
                 logging.warning(f"Skipping state_proj key in pi05 mode: {key}")
                 continue
 
+            # Remap legacy paligemma keys from flat to nested
+            if new_key.startswith(paligemma_prefix_flat):
+                new_key = new_key.replace(paligemma_prefix_flat, paligemma_prefix_nested)
+            elif new_key.startswith(paligemma_prefix_flat.removeprefix("model.")):
+                new_key = new_key.replace(
+                    paligemma_prefix_flat.removeprefix("model."),
+                    paligemma_prefix_nested.removeprefix("model."),
+                )
+
+            # If LoRA is enabled and checkpoint is non-LoRA, map flat proj weights to base_layer (language only)
+            if getattr(self.config, "use_lora", False) and "language_model" in new_key:
+                # Attention projections
+                for proj in ["q_proj", "k_proj", "v_proj", "o_proj"]:
+                    suffix = f".self_attn.{proj}.weight"
+                    if new_key.endswith(suffix) and "base_layer" not in new_key:
+                        new_key = new_key.replace(suffix, f".self_attn.{proj}.base_layer.weight")
+                        break
+                # MLP projections
+                for proj in ["gate_proj", "up_proj", "down_proj"]:
+                    suffix = f".mlp.{proj}.weight"
+                    if new_key.endswith(suffix) and "base_layer" not in new_key:
+                        new_key = new_key.replace(suffix, f".mlp.{proj}.base_layer.weight")
+                        break
+                # Map lm_head to embeddings for non-LoRA checkpoints (PEFT ties head to embed tokens)
+                if new_key.endswith("paligemma_with_expert.paligemma.lm_head.weight"):
+                    new_key = new_key.replace(
+                        "paligemma_with_expert.paligemma.lm_head.weight",
+                        "paligemma_with_expert.paligemma.base_model.model.model.language_model.embed_tokens.base_layer.weight",
+                    )
+
             # Handle vision tower embedding layer potential differences
             if "patch_embedding" in key:
-                # Some checkpoints might have this, but current model expects different structure
                 logging.warning(f"Vision embedding key might need handling: {key}")
 
             fixed_state_dict[new_key] = value
 
+        # # Fallback: some checkpoints omit the tied embed_tokens weight; reuse lm_head weight instead.
+        # embed_key = (
+        #     "model.paligemma_with_expert.paligemma.base_model.model.model.language_model.embed_tokens.weight"
+        # )
+        # lm_head_key = "model.paligemma_with_expert.paligemma.base_model.model.lm_head.weight"
+        # if embed_key not in fixed_state_dict and lm_head_key in fixed_state_dict:
+        #     logging.warning(f"Tying missing embed_tokens weight from lm_head weight: {lm_head_key} -> {embed_key}")
+        #     fixed_state_dict[embed_key] = fixed_state_dict[lm_head_key]
+
         return fixed_state_dict
+
 
     def get_optim_params(self) -> dict:
         return self.parameters()
@@ -1244,10 +1330,10 @@ class PI05IMLELoRAPolicy(PreTrainedPolicy):
         losses = losses[:, :, :original_action_dim]
 
         loss = losses.mean()
-
+        loss_per_dim = losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist()
         loss_dict = {
             "loss": loss.item(),
-            "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
+             **{f"loss_per_dim/{i}": v for i, v in enumerate(loss_per_dim)},
         }
 
         return loss, loss_dict
