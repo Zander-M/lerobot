@@ -89,6 +89,7 @@ class PI05IMLELoRAConfig(PreTrainedConfig):
 
     # LoRA related configs
     use_lora: bool = False
+    zero_lora: bool = False # Set LoRA params to 0. Train the IMLE only
     lora_r: int = 16
     lora_alpha: int = 32
     lora_dropout: float = 0.05
