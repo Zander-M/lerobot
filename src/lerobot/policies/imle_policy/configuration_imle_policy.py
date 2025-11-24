@@ -60,6 +60,8 @@ class IMLEConfig(PreTrainedConfig):
     dataset_path: str = "HuggingFaceVLA/libero"
     num_diffusion_iters: int = 100
     device: str | None = None  # Allow auto device selection
+    n_samples_per_condition: int = 20
+    epsilon: float = 0.03
     max_steps: int = 520  # Adjust according to task
     seed_start: int = 0
     num_trails: int = 50
