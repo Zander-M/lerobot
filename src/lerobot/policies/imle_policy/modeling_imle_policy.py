@@ -4,6 +4,8 @@
 # This wires the existing IMLE UNet and loss into the PreTrainedPolicy
 # interface so it can be trained and evaluated with the common pipeline.
 
+from collections import deque
+
 import torch
 from torch import nn, Tensor
 
@@ -13,7 +15,7 @@ from lerobot.policies.imle_policy.models.vision_network import get_resnet, repla
 from lerobot.policies.imle_policy.utils.losses import rs_imle_loss
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.configs.types import FeatureType
-
+from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 
 class IMLEPolicy(PreTrainedPolicy):
     """
@@ -30,14 +32,18 @@ class IMLEPolicy(PreTrainedPolicy):
         self.config = config
 
         self.device = torch.device(config.device) if config.device is not None else torch.device("cpu")
+        self._queues = None
 
         # Build vision encoders for all visual inputs defined in the config.
+        self._vision_key_map = {}
         self.vision_encoders = nn.ModuleDict()
         for key, feature in config.input_features.items():
             if feature.type == FeatureType.VISUAL:
+                clean = key.replace(".", "_") # Remove "." from key
+                self._vision_key_map[clean] = key
                 encoder = get_resnet("resnet18")
                 encoder = replace_bn_with_gn(encoder)
-                self.vision_encoders[key] = encoder
+                self.vision_encoders[clean] = encoder
 
         # IMLE generator network.
         self.policy_net = GeneratorConditionalUnet1D(
@@ -52,7 +58,14 @@ class IMLEPolicy(PreTrainedPolicy):
         return [{"params": [p for p in self.parameters() if p.requires_grad]}]
 
     def reset(self):
-        # No recurrent state to clear.
+        self._queues = {
+            OBS_STATE: deque(maxlen=self.config.n_obs_steps),
+            ACTION: deque(maxlen=self.config.n_action_steps),
+        }
+        if self.config.image_features:
+            self._queues[OBS_IMAGES] = deque(maxlen=self.config.n_obs_steps)
+        if self.config.env_state_feature:
+            self._queues[OBS_ENV_STATE] = deque(maxlen=self.config.n_obs_steps)
         return
 
     def _encode_observations(self, batch: dict[str, Tensor]) -> Tensor:
@@ -67,10 +80,10 @@ class IMLEPolicy(PreTrainedPolicy):
         pieces = []
 
         # Encode images.
-        for key, encoder in self.vision_encoders.items():
-            if key not in batch:
-                raise KeyError(f"Expected image key '{key}' in batch for IMLEPolicy.")
-            imgs = batch[key][:, :obs_h].to(self.device)  # [B, T, C, H, W]
+        for clean_key, encoder in self.vision_encoders.items():
+            batch_key = self._vision_key_map[clean_key]
+            imgs = batch[batch_key].to(self.device)
+            imgs = imgs[:, :obs_h]  # [B, T, C, H, W]
             b, t, c, h, w = imgs.shape
             feats = encoder(imgs.reshape(b * t, c, h, w))  # [B*T, feat_dim]
             feats = feats.reshape(b, t, -1)
@@ -79,7 +92,8 @@ class IMLEPolicy(PreTrainedPolicy):
         # Low-dim observations.
         if "observation.state" not in batch:
             raise KeyError("Expected 'observation.state' in batch for IMLEPolicy.")
-        state = batch["observation.state"][:, :obs_h].to(self.device)  # [B, T, D]
+        state = batch["observation.state"].to(self.device)
+        state = state[:, :obs_h]  # [B, T, D]
         pieces.append(state)
 
         # Concatenate features along channel dim, then flatten time.
@@ -99,36 +113,39 @@ class IMLEPolicy(PreTrainedPolicy):
             - actions under "action": [B, T_action, action_dim]
             - images and state as in `_encode_observations`.
         """
-        actions = batch["action"][:, : self.config.action_horizon].to(self.device)
+        actions = batch["action"][:, : self.config.n_action_steps].to(self.device)
         global_cond = self._encode_observations(batch).to(self.device)
 
         b = actions.shape[0]
         n_samples = self.config.n_samples_per_condition
         noise = torch.randn(
-            b * n_samples, self.config.action_horizon, self.config.action_dim, device=self.device
+            b * n_samples, self.config.n_action_steps, self.config.action_dim, device=self.device
         )
 
         repeated_cond = global_cond.repeat_interleave(n_samples, dim=0)
         preds = self.policy_net(repeated_cond, noise)
-        preds = preds.view(b, n_samples, self.config.action_horizon, self.config.action_dim)
+        preds = preds.view(b, n_samples, self.config.n_action_steps, self.config.action_dim)
 
         loss, logs = rs_imle_loss(actions, preds, epsilon=self.config.epsilon)
         return loss, logs
 
+    @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
         """
             Sample one action chunk by drawing a single noise sample.
         """
+        batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
         global_cond = self._encode_observations(batch).to(self.device)
         actions_shape = (
             global_cond.shape[0],
-            self.config.action_horizon,
+            self.config.n_action_steps,
             self.config.action_dim,
         )
         noise = torch.randn(actions_shape, device=self.device)
         preds = self.policy_net(global_cond, noise)
         return preds.detach()
 
+    @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
         """
             Return the first action in the predicted chunk.
