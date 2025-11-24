@@ -11,7 +11,7 @@ from lerobot.optim.optimizers import AdamWConfig
 
 @PreTrainedConfig.register_subclass("imle_policy")
 @dataclass
-class IMLEConfg(PreTrainedConfig):
+class IMLEConfig(PreTrainedConfig):
     """
     Configuration for the standalone IMLE policy.
 
