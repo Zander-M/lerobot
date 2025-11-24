@@ -302,6 +302,14 @@ def make_pre_post_processors(
             dataset_stats=kwargs.get("dataset_stats"),
         )
 
+    elif isinstance(policy_cfg, IMLEConfig):
+        from lerobot.policies.imle_policy.processor_imle_policy import make_imle_pre_post_processors
+
+        processors = make_imle_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
     elif isinstance(policy_cfg, PI0Config):
         from lerobot.policies.pi0.processor_pi0 import make_pi0_pre_post_processors
 
