@@ -90,6 +90,10 @@ class IMLEConfig(PreTrainedConfig):
             weight_decay=self.optimizer_weight_decay,
         )
 
+    def validate_features(self) -> None:
+        if not self.image_features and not self.env_state_feature:
+            raise ValueError("You must provide at least one image or the environment state among the inputs.")
+
     def get_scheduler_preset(self) -> None:
         return None
 
