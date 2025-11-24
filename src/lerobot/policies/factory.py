@@ -31,8 +31,10 @@ from lerobot.envs.utils import env_to_policy_features
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.policies.groot.configuration_groot import GrootConfig
+from lerobot.policies.imle_policy.configuration_imle_policy import IMLEConfig 
 from lerobot.policies.pi0.configuration_pi0 import PI0Config
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
+from lerobot.policies.pi05_imle.configuration_pi05_imle import PI05IMLEConfig
 from lerobot.policies.pi05_imle_lora.configuration_pi05_imle_lora import PI05IMLELoRAConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.sac.configuration_sac import SACConfig
@@ -88,10 +90,17 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from lerobot.policies.pi0.modeling_pi0 import PI0Policy
 
         return PI0Policy
+    elif name == "imle_policy":
+        from lerobot.policies.imle_policy.modeling_imle_policy import IMLEPolicy
+
+        return IMLEPolicy
     elif name == "pi05":
         from lerobot.policies.pi05.modeling_pi05 import PI05Policy
 
         return PI05Policy
+    elif name == "pi05_imle":
+        from lerobot.policies.pi05_imle.modeling_pi05_imle import PI05IMLEPolicy as PI05IMLEPolicy
+
     elif name == "pi05_imle_lora":
         from lerobot.policies.pi05_imle_lora.modeling_pi05_imle_lora import PI05IMLELoRAPolicy as PI05IMLELoRAPolicy
 
@@ -143,10 +152,14 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return ACTConfig(**kwargs)
     elif policy_type == "vqbet":
         return VQBeTConfig(**kwargs)
+    elif policy_type == "imle_policy":
+        return IMLEConfig(**kwargs)
     elif policy_type == "pi0":
         return PI0Config(**kwargs)
     elif policy_type == "pi05":
         return PI05Config(**kwargs)
+    elif policy_type == "pi05_imle":
+        return PI05IMLEConfig(**kwargs)
     elif policy_type == "pi05_imle_lora":
         return PI05IMLELoRAConfig(**kwargs)
     elif policy_type == "sac":
