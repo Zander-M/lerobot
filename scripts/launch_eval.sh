@@ -11,10 +11,8 @@ conda run --no-capture-output -n lerobot lerobot-eval \
     --env.task=libero_spatial \
     --eval.batch_size=1 \
     --eval.n_episodes=10 \
-    --policy.path=/localhome/zma40/Desktop/project/generative_models_course_project/models/pi05_imle_libero_fintuned \
+    --policy.path=/localhome/zma40/Desktop/project/generative_models_course_project/models/pi05_imle_lora_libero_finetuned \
     --policy.compile_model=false \
     --policy.device=cuda \
-    --policy.device=cuda \
     --env.max_parallel_tasks=1 \
-    # --policy.use_lora=true\
-    # --policy.zero_lora=true \
+    --policy.use_lora=false\
