@@ -22,7 +22,7 @@ import numpy as np
 import torch
 
 from lerobot.configs.types import PipelineFeatureType, PolicyFeature
-from lerobot.policies.pi05.modeling_pi05 import pad_vector
+from lerobot.policies.pi05_imle_lora.modeling_pi05_imle_lora import pad_vector
 from lerobot.policies.pi05_imle_lora.configuration_pi05_imle_lora import PI05IMLELoRAConfig
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
@@ -105,7 +105,7 @@ def make_pi05_pre_post_processors(
     PolicyProcessorPipeline[PolicyAction, PolicyAction],
 ]:
     """
-    Constructs pre-processor and post-processor pipelines for the PI05 IMLE policy.
+    Constructs pre-processor and post-processor pipelines for the PI05 IMLE LoRA policy.
 
     The pre-processing pipeline prepares input data for the model by:
     1. Renaming features to match pretrained configurations.
@@ -120,7 +120,7 @@ def make_pi05_pre_post_processors(
     2. Unnormalizing the output features to their original scale.
 
     Args:
-        config: The configuration object for the PI05 IMLE policy.
+        config: The configuration object for the PI05 IMLE LoRA policy.
         dataset_stats: A dictionary of statistics for normalization.
         preprocessor_kwargs: Additional arguments for the pre-processor pipeline.
         postprocessor_kwargs: Additional arguments for the post-processor pipeline.
@@ -133,14 +133,14 @@ def make_pi05_pre_post_processors(
     input_steps: list[ProcessorStep] = [
         RenameObservationsProcessorStep(rename_map={}),  # To mimic the same processor as pretrained one
         AddBatchDimensionProcessorStep(),
-        # NOTE: NormalizerProcessorStep MUST come before Pi05PrepareStateTokenizerProcessorStep
+        # NOTE: NormalizerProcessorStep MUST come before Pi05IMLELoRAPrepareStateTokenizerProcessorStep
         # because the tokenizer step expects normalized state in [-1, 1] range for discretization
         NormalizerProcessorStep(
             features={**config.input_features, **config.output_features},
             norm_map=config.normalization_mapping,
             stats=dataset_stats,
         ),
-        Pi05PrepareStateTokenizerProcessorStep(max_state_dim=config.max_state_dim),
+        Pi05IMLELoRAPrepareStateTokenizerProcessorStep(max_state_dim=config.max_state_dim),
         TokenizerProcessorStep(
             tokenizer_name="google/paligemma-3b-pt-224",
             max_length=config.tokenizer_max_length,
