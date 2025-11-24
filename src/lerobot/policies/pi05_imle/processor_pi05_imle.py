@@ -14,6 +14,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Processors adapted from PI05 policy. Since the model input takes the vision
+# language input from the dataset and use Paligemma 2B model to generate an
+# latent embedding, the pre-processing steps are the same as the Pi05 policy.
+
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
