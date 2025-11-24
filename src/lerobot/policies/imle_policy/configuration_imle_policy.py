@@ -70,6 +70,7 @@ class IMLEConfig(PreTrainedConfig):
         )
 
     def validate_features(self) -> None:
+        # TODO: perform necessary checks here.
         if not self.image_features and not self.env_state_feature:
             raise ValueError("You must provide at least one image or the environment state among the inputs.")
 

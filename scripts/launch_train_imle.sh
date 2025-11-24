@@ -10,8 +10,7 @@ export TS=$(date +"%Y%m%d-%H%M%S")
 # policy.compile_model set to false due to limited shared memory
 
 conda run --no-capture-output -n lerobot lerobot-train\
-  --dataset.repo_id=libero \
-  --dataset.root=/localhome/zma40/Desktop/project/generative_models_course_project/dataset/libero \
+  --dataset.repo_id=zak1040/libero_spatial_image_v3 \
   --policy.type=imle_policy\
   --output_dir=outputs/imle_policy_${TS} \
   --policy.push_to_hub=false \
