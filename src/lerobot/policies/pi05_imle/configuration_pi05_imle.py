@@ -84,6 +84,10 @@ class PI05IMLEConfig(PreTrainedConfig):
 
     tokenizer_max_length: int = 200  # see openpi `__post_init__`
 
+    # IMLE Setting
+    imle_epsilon: float = 0.03 # IMLE epsilon
+    imle_num_samples: int = 64 # number of imle samples 
+
     def __post_init__(self):
         super().__post_init__()
 

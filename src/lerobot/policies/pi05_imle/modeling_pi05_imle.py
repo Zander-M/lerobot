@@ -14,12 +14,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import builtins
 import logging
 import math
 from collections import deque
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, Any
 
 import torch
 import torch.nn.functional as F  # noqa: N812
@@ -49,6 +51,30 @@ from lerobot.utils.constants import (
     OPENPI_ATTENTION_MASK_VALUE,
 )
 
+### IMLE Loss from IMLE Policy
+
+def rs_imle_loss(real_samples, fake_samples, epsilon=0.03):
+    B, T, D = real_samples.shape
+    n_samples = fake_samples.shape[1]
+
+    real_flat = real_samples.reshape(B, 1, -1)
+    fake_flat = fake_samples.reshape(B, n_samples, -1)
+
+    distances = torch.cdist(real_flat, fake_flat).squeeze(1)
+
+    valid_samples = (distances > epsilon).float()
+    # wandb.log({"max_distance": distances.max().item(), "min_distance": distances.min().item(), "mean_distance": distances.mean().item(), "epsilon": epsilon})
+    min_distances, _ = (distances + (1 - valid_samples) * distances.max()).min(dim=1)
+    valid_real_samples = (min_distances < distances.max()).float()
+    if valid_real_samples.sum() > 0:
+        loss = (min_distances * valid_real_samples).sum() / valid_real_samples.sum()
+    else:
+        loss = torch.tensor(0.0, device=real_samples.device)
+
+    wandb_log = ({"max_distance": distances.max().item(), "min_distance": distances.min().item(), "mean_distance": distances.mean().item(), "epsilon": epsilon, "loss": loss.item()})
+    return loss, wandb_log
+
+### Util functions
 
 def get_safe_dtype(target_dtype, device_type):
     """Get a safe dtype for the given device type."""
@@ -528,6 +554,12 @@ class PI05IMLEPytorch(nn.Module):  # modified from openpi `PI0Pytorch`
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
 
+        # Freeze PaliGemma2B model parameters. In LoRA version this should decide
+        # if we freeze the model or use LoRA finetuning 
+        for p in self.paligemma_with_expert.paligemma.parameters():
+            p.requires_grad = False
+        self.paligemma_with_expert.paligemma.eval()
+
         # Compile model if requested
         if config.compile_model:
             torch.set_float32_matmul_precision("high")
@@ -631,41 +663,23 @@ class PI05IMLEPytorch(nn.Module):  # modified from openpi `PI0Pytorch`
 
         return embs, pad_masks, att_masks
 
-    def embed_suffix(self, noisy_actions, timestep):
+    def embed_suffix(self, noisy_actions):
         """Embed noisy_actions, timestep to prepare for Expert Gemma processing."""
         embs = []
         pad_masks = []
         att_masks = []
 
-        # Embed timestep using sine-cosine positional encoding
-        time_emb = create_sinusoidal_pos_embedding(
-            timestep,
-            self.action_in_proj.out_features,
-            min_period=self.config.min_period,
-            max_period=self.config.max_period,
-            device=timestep.device,
-        )
-        time_emb = time_emb.type(dtype=timestep.dtype)
-
-        # Fuse timestep + action information using an MLP
         def action_proj_func(noisy_actions):
             return self.action_in_proj(noisy_actions)
 
         action_emb = self._apply_checkpoint(action_proj_func, noisy_actions)
 
-        def time_mlp_func(time_emb):
-            x = self.time_mlp_in(time_emb)
-            x = F.silu(x)
-            x = self.time_mlp_out(x)
-            return F.silu(x)
+        adarms_cond = None
 
-        time_emb = self._apply_checkpoint(time_mlp_func, time_emb)
-        action_time_emb = action_emb
-        adarms_cond = time_emb
+        embs.append(action_emb)
 
-        embs.append(action_time_emb)
-        bsize, action_time_dim = action_time_emb.shape[:2]
-        action_time_mask = torch.ones(bsize, action_time_dim, dtype=torch.bool, device=timestep.device)
+        bsize, action_time_dim = action_emb.shape[:2]
+        action_time_mask = torch.ones(bsize, action_time_dim, dtype=torch.bool, device=noisy_actions.device)
         pad_masks.append(action_time_mask)
 
         # Set attention masks so that image, language and state inputs do not attend to action tokens
@@ -674,25 +688,32 @@ class PI05IMLEPytorch(nn.Module):  # modified from openpi `PI0Pytorch`
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
         att_masks = torch.tensor(att_masks, dtype=embs.dtype, device=embs.device)
-        att_masks = att_masks[None, :].expand(bsize, len(att_masks))
-
         return embs, pad_masks, att_masks, adarms_cond
 
-    def forward(self, images, img_masks, tokens, masks, actions, noise=None, time=None) -> Tensor:
+    def forward(self, images, img_masks, tokens, masks, actions) -> tuple[Tensor, dict[str, Any]]:
         """Do a full training forward pass and compute the loss."""
-        if noise is None:
-            noise = self.sample_noise(actions.shape, actions.device)
 
-        if time is None:
-            time = self.sample_time(actions.shape[0], actions.device)
+        B, T, D = actions.shape
+        S = self.config.imle_num_samples # number of imle samples
+        device = actions.device
 
-        time_expanded = time[:, None, None]
-        x_t = time_expanded * noise + (1 - time_expanded) * actions
-        u_t = noise - actions
-
+        # Context embedding and expansion to match dimension
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
+        prefix_embs = prefix_embs.repeat_interleave(S, dim=0)
+        prefix_pad_masks = prefix_pad_masks.repeat_interleave(S, dim=0)
+        prefix_att_masks = prefix_att_masks.repeat_interleave(S, dim=0)
 
+        # IMLE random samples
+        noise_shape = (B, S, T, D)
+
+        noise = self.sample_noise(noise_shape, device)
+
+        noise_flat = noise.reshape(B*S, T, D)
+
+        # For one step generation, no time dim needed. Adding this for suffix embedding
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(noise_flat)
+
+        # dtype fix if needed
         if (
             self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
             == torch.bfloat16
@@ -715,7 +736,7 @@ class PI05IMLEPytorch(nn.Module):  # modified from openpi `PI0Pytorch`
                 past_key_values=None,
                 inputs_embeds=[prefix_embs, suffix_embs],
                 use_cache=False,
-                adarms_cond=[None, adarms_cond],
+                adarms_cond=[None, None], # no adarms_cond
             )
             return suffix_out
 
@@ -729,9 +750,11 @@ class PI05IMLEPytorch(nn.Module):  # modified from openpi `PI0Pytorch`
         def action_out_proj_func(suffix_out):
             return self.action_out_proj(suffix_out)
 
-        v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
+        fake_actions_flat = self._apply_checkpoint(action_out_proj_func, suffix_out)
+        fake_actions = fake_actions_flat.reshape(B, S, T, D)
 
-        return F.mse_loss(u_t, v_t, reduction="none")
+        loss, wandb_log = rs_imle_loss(actions, fake_actions, epsilon=self.config.imle_epsilon)
+        return loss, wandb_log 
 
     @torch.no_grad()  # see openpi `sample_actions` (slightly adapted)
     def sample_actions(self, images, img_masks, tokens, masks, noise=None, num_steps=None) -> Tensor:
@@ -1150,7 +1173,7 @@ class PI05IMLEPolicy(PreTrainedPolicy):
         actions = self.prepare_action(batch)
 
         # Compute loss (no separate state needed for PI05)
-        losses = self.model.forward(images, img_masks, tokens, masks, actions)
+        losses, wandb_log = self.model.forward(images, img_masks, tokens, masks, actions)
 
         # Truncate losses to actual action dimensions
         original_action_dim = self.config.output_features[ACTION].shape[0]
@@ -1158,17 +1181,4 @@ class PI05IMLEPolicy(PreTrainedPolicy):
 
         loss = losses.mean()
 
-        losses_per_dim = {
-            f"dim_{k}": loss 
-            for k, loss 
-            in enumerate(losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist())
-        }
-
-        # updated to make the loss wandb compatible
-
-        loss_dict = {
-            "loss": loss.item(),
-            "loss_per_dim": losses_per_dim
-        }
-
-        return loss, loss_dict
+        return loss, wandb_log
