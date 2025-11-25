@@ -53,12 +53,12 @@ from lerobot.utils.constants import (
 
 ### IMLE Loss from IMLE Policy
 
-def rs_imle_loss(real_samples, fake_samples, epsilon=0.03):
-    B, T, D = real_samples.shape
-    n_samples = fake_samples.shape[1]
+def rs_imle_loss(actions, sampled_actions, epsilon=0.03):
+    B, T, D = actions.shape
+    n_samples = sampled_actions.shape[1]
 
-    real_flat = real_samples.reshape(B, 1, -1)
-    fake_flat = fake_samples.reshape(B, n_samples, -1)
+    real_flat = actions.reshape(B, 1, -1)
+    fake_flat = sampled_actions.reshape(B, n_samples, -1)
 
     distances = torch.cdist(real_flat, fake_flat).squeeze(1)
 
@@ -69,7 +69,7 @@ def rs_imle_loss(real_samples, fake_samples, epsilon=0.03):
     if valid_real_samples.sum() > 0:
         loss = (min_distances * valid_real_samples).sum() / valid_real_samples.sum()
     else:
-        loss = torch.tensor(0.0, device=real_samples.device)
+        loss = torch.tensor(0.0, device=actions.device)
 
     wandb_log = ({"max_distance": distances.max().item(), "min_distance": distances.min().item(), "mean_distance": distances.mean().item(), "epsilon": epsilon, "loss": loss.item()})
     return loss, wandb_log
@@ -87,34 +87,6 @@ def get_safe_dtype(target_dtype, device_type):
         if target_dtype == torch.float64:
             return torch.float64
     return target_dtype
-
-
-def create_sinusoidal_pos_embedding(  # see openpi `create_sinusoidal_pos_embedding` (exact copy)
-    time: torch.Tensor, dimension: int, min_period: float, max_period: float, device="cpu"
-) -> Tensor:
-    """Computes sine-cosine positional embedding vectors for scalar positions."""
-    if dimension % 2 != 0:
-        raise ValueError(f"dimension ({dimension}) must be divisible by 2")
-
-    if time.ndim != 1:
-        raise ValueError("The time tensor is expected to be of shape `(batch_size, )`.")
-
-    dtype = get_safe_dtype(torch.float64, device.type)
-    fraction = torch.linspace(0.0, 1.0, dimension // 2, dtype=dtype, device=device)
-    period = min_period * (max_period / min_period) ** fraction
-
-    # Compute the outer product
-    scaling_factor = 1.0 / period * 2 * math.pi
-    sin_input = scaling_factor[None, :] * time[:, None]
-    return torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=1)
-
-
-def sample_beta(alpha, beta, bsize, device):  # see openpi `sample_beta` (exact copy)
-    alpha_t = torch.as_tensor(alpha, dtype=torch.float32, device=device)
-    beta_t = torch.as_tensor(beta, dtype=torch.float32, device=device)
-    dist = torch.distributions.Beta(alpha_t, beta_t)
-    return dist.sample((bsize,))
-
 
 def make_att_2d_masks(pad_masks, att_masks):  # see openpi `make_att_2d_masks` (exact copy)
     """Copied from big_vision.
@@ -342,9 +314,6 @@ def get_gemma_config(variant: str) -> GemmaConfig:  # see openpi `gemma.py: get_
     else:
         raise ValueError(f"Unknown variant: {variant}")
 
-
-# TODO: rewrite this part. Make IMLE the main generation model, PaliGemma just provides the context.
-# Treat its parameters as fixed for now.
 class PaliGemmaWithExpertModel(
     nn.Module
 ):  # see openpi `gemma_pytorch.py: PaliGemmaWithExpertModel` this class is almost a exact copy of PaliGemmaWithExpertModel in openpi
@@ -428,7 +397,6 @@ class PaliGemmaWithExpertModel(
     def embed_language_tokens(self, tokens: torch.Tensor):
         return self.paligemma.language_model.embed_tokens(tokens)
 
-    # TODO: Change to IMLE forward
     def forward(
         self,
         attention_mask: torch.Tensor | None = None,
@@ -613,13 +581,6 @@ class PI05IMLEPytorch(nn.Module):  # modified from openpi `PI0Pytorch`
             device=device,
         )
 
-    def sample_time(self, bsize, device):
-        time_beta = sample_beta(
-            self.config.time_sampling_beta_alpha, self.config.time_sampling_beta_beta, bsize, device
-        )
-        time = time_beta * self.config.time_sampling_scale + self.config.time_sampling_offset
-        return time.to(dtype=torch.float32, device=device)
-
     def embed_prefix(
         self, images, img_masks, tokens, masks
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -759,17 +720,15 @@ class PI05IMLEPytorch(nn.Module):  # modified from openpi `PI0Pytorch`
         def action_out_proj_func(suffix_out):
             return self.action_out_proj(suffix_out)
 
-        fake_actions_flat = self._apply_checkpoint(action_out_proj_func, suffix_out)
-        fake_actions = fake_actions_flat.reshape(B, S, T, D)
+        sampled_actions_flat = self._apply_checkpoint(action_out_proj_func, suffix_out)
+        sampled_actions = sampled_actions_flat.reshape(B, S, T, D)
 
-        loss, wandb_log = rs_imle_loss(actions, fake_actions, epsilon=self.config.imle_epsilon)
+        loss, wandb_log = rs_imle_loss(actions, sampled_actions, epsilon=self.config.imle_epsilon)
         return loss, wandb_log 
 
-    @torch.no_grad()  # see openpi `sample_actions` (slightly adapted)
-    def sample_actions(self, images, img_masks, tokens, masks, noise=None, num_steps=None) -> Tensor:
+    @torch.no_grad()  
+    def sample_actions(self, images, img_masks, tokens, masks, noise=None) -> Tensor:
         """Do a full inference forward and compute the action."""
-        if num_steps is None:
-            num_steps = self.config.num_inference_steps
 
         bsize = tokens.shape[0]
         device = tokens.device
@@ -790,6 +749,7 @@ class PI05IMLEPytorch(nn.Module):  # modified from openpi `PI0Pytorch`
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
         self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
 
+        # Generating conditional embedded from prefix_embs (past_key_values)
         _, past_key_values = self.paligemma_with_expert.forward(
             attention_mask=prefix_att_2d_masks_4d,
             position_ids=prefix_position_ids,
@@ -798,51 +758,17 @@ class PI05IMLEPytorch(nn.Module):  # modified from openpi `PI0Pytorch`
             use_cache=True,
         )
 
-        dt = -1.0 / num_steps
-        dt = torch.tensor(dt, dtype=torch.float32, device=device)
-
-        x_t = noise
-        time = torch.tensor(1.0, dtype=torch.float32, device=device)
-        while time >= -dt / 2:
-            expanded_time = time.expand(bsize)
-            v_t = self.denoise_step(
-                prefix_pad_masks,
-                past_key_values,
-                x_t,
-                expanded_time,
-            )
-            x_t = x_t + dt * v_t
-            time += dt
-
-        return x_t
-
-    def denoise_step(
-        self,
-        prefix_pad_masks,
-        past_key_values,
-        x_t,
-        timestep,
-    ):
-        """Apply one denoising step of the noise `x_t` at a given timestep."""
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, timestep)
-
-        suffix_len = suffix_pad_masks.shape[1]
-        batch_size = prefix_pad_masks.shape[0]
-        prefix_len = prefix_pad_masks.shape[1]
-
-        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
+        # Generate action chunk based on condition (past_key_values)
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(noise)
         suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
-        full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
+        suffix_position_ids = torch.cumsum(suffix_pad_masks, dim=1) -1
 
-        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
-        position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
-
-        full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
+        suffix_att_2d_masks_4d= self._prepare_attention_masks_4d(suffix_att_2d_masks)
         self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
 
         outputs_embeds, _ = self.paligemma_with_expert.forward(
-            attention_mask=full_att_2d_masks_4d,
-            position_ids=position_ids,
+            attention_mask=suffix_att_2d_masks_4d,
+            position_ids=suffix_position_ids,
             past_key_values=past_key_values,
             inputs_embeds=[None, suffix_embs],
             use_cache=False,
@@ -853,7 +779,6 @@ class PI05IMLEPytorch(nn.Module):  # modified from openpi `PI0Pytorch`
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         suffix_out = suffix_out.to(dtype=torch.float32)
         return self.action_out_proj(suffix_out)
-
 
 class PI05IMLEPolicy(PreTrainedPolicy):
     """PI05 Policy for LeRobot."""

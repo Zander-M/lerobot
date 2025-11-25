@@ -36,16 +36,6 @@ class PI05IMLEConfig(PreTrainedConfig):
     # Shorter state and action vectors will be padded to these dimensions
     max_state_dim: int = 32
     max_action_dim: int = 32
-    # TODO: add noise dim.
-
-    # Flow matching parameters: see openpi `PI0Pytorch`
-    num_inference_steps: int = 10
-    time_sampling_beta_alpha: float = 1.5
-    time_sampling_beta_beta: float = 1.0
-    time_sampling_scale: float = 0.999
-    time_sampling_offset: float = 0.001
-    min_period: float = 4e-3
-    max_period: float = 4.0
 
     image_resolution: tuple[int, int] = (224, 224)  # see openpi `preprocessing_pytorch.py`
 
