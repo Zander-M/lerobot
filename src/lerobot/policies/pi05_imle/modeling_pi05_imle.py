@@ -541,7 +541,7 @@ class PI05IMLEPytorch(nn.Module):  # modified from openpi `PI0Pytorch`
         self.paligemma_with_expert = PaliGemmaWithExpertModel(
             paligemma_config,
             action_expert_config,
-            use_adarms=[False, True],
+            use_adarms=[False, False],
             precision=config.dtype,
         )
 
@@ -664,31 +664,40 @@ class PI05IMLEPytorch(nn.Module):  # modified from openpi `PI0Pytorch`
         return embs, pad_masks, att_masks
 
     def embed_suffix(self, noisy_actions):
-        """Embed noisy_actions, timestep to prepare for Expert Gemma processing."""
+        """Embed noisy_actions for Expert Gemma processing."""
         embs = []
         pad_masks = []
-        att_masks = []
 
+        # Project actions → model dimension
         def action_proj_func(noisy_actions):
             return self.action_in_proj(noisy_actions)
 
         action_emb = self._apply_checkpoint(action_proj_func, noisy_actions)
-
-        adarms_cond = None
-
         embs.append(action_emb)
 
-        bsize, action_time_dim = action_emb.shape[:2]
-        action_time_mask = torch.ones(bsize, action_time_dim, dtype=torch.bool, device=noisy_actions.device)
-        pad_masks.append(action_time_mask)
+        B, L = action_emb.shape[:2]
+        device = noisy_actions.device
 
-        # Set attention masks so that image, language and state inputs do not attend to action tokens
-        att_masks += [1] + ([0] * (self.config.chunk_size - 1))
+        # All action tokens are valid
+        pad_mask = torch.ones(B, L, dtype=torch.bool, device=device)
+        pad_masks.append(pad_mask)
 
+        base = torch.tensor(
+            [1] + [0] * (self.config.chunk_size - 1),
+            dtype=torch.bool,
+            device=device
+        )  # (L,)
+
+        # Expand to batch
+        att_masks = base.unsqueeze(0).expand(B, L)  # (B, L)
+
+        # Final assembly
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
-        att_masks = torch.tensor(att_masks, dtype=embs.dtype, device=embs.device)
+
+        adarms_cond = None
         return embs, pad_masks, att_masks, adarms_cond
+
 
     def forward(self, images, img_masks, tokens, masks, actions) -> tuple[Tensor, dict[str, Any]]:
         """Do a full training forward pass and compute the loss."""
@@ -1176,8 +1185,8 @@ class PI05IMLEPolicy(PreTrainedPolicy):
         losses, wandb_log = self.model.forward(images, img_masks, tokens, masks, actions)
 
         # Truncate losses to actual action dimensions
-        original_action_dim = self.config.output_features[ACTION].shape[0]
-        losses = losses[:, :, :original_action_dim]
+        # original_action_dim = self.config.output_features[ACTION].shape[0]
+        # losses = losses[:, :, :original_action_dim]
 
         loss = losses.mean()
 

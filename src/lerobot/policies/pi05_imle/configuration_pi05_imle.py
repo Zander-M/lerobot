@@ -86,7 +86,7 @@ class PI05IMLEConfig(PreTrainedConfig):
 
     # IMLE Setting
     imle_epsilon: float = 0.03 # IMLE epsilon
-    imle_num_samples: int = 64 # number of imle samples 
+    imle_num_samples: int = 8 # number of imle samples 
 
     def __post_init__(self):
         super().__post_init__()
