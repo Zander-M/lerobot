@@ -97,7 +97,7 @@ class Pi05IMLELoRAPrepareStateTokenizerProcessorStep(ProcessorStep):
         return features
 
 
-def make_pi05_pre_post_processors(
+def make_pi05_imle_lora_pre_post_processors(
     config: PI05IMLELoRAConfig,
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
 ) -> tuple[

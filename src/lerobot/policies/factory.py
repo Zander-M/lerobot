@@ -98,9 +98,11 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from lerobot.policies.pi05.modeling_pi05 import PI05Policy
 
         return PI05Policy
+
     elif name == "pi05_imle":
         from lerobot.policies.pi05_imle.modeling_pi05_imle import PI05IMLEPolicy as PI05IMLEPolicy
-
+        
+        return PI05IMLEPolicy
     elif name == "pi05_imle_lora":
         from lerobot.policies.pi05_imle_lora.modeling_pi05_imle_lora import PI05IMLELoRAPolicy as PI05IMLELoRAPolicy
 
@@ -319,15 +321,23 @@ def make_pre_post_processors(
         )
 
     elif isinstance(policy_cfg, PI05Config):
-        from lerobot.policies.pi05.processor_pi05 import make_pi05_pre_post_processors
+        from lerobot.policies.pi05.processor_pi05 import make_pi05_imle_pre_post_processors
 
         processors = make_pi05_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )
 
+    elif isinstance(policy_cfg, PI05IMLEConfig):
+        from lerobot.policies.pi05_imle.processor_pi05_imle import make_pi05_imle_pre_post_processors
+
+        processors = make_pi05_imle_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
     elif isinstance(policy_cfg, PI05IMLELoRAConfig):
-        from lerobot.policies.pi05_imle_lora.processor_pi05_imle_lora import make_pi05_pre_post_processors
+        from lerobot.policies.pi05_imle_lora.processor_pi05_imle_lora import make_pi05_imle_lora_pre_post_processors
 
         processors = make_pi05_pre_post_processors(
             config=policy_cfg,

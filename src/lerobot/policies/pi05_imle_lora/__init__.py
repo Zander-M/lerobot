@@ -16,6 +16,6 @@
 
 from .configuration_pi05_imle_lora import PI05IMLELoRAConfig
 from .modeling_pi05_imle_lora import PI05IMLELoRAPolicy
-from .processor_pi05_imle_lora import make_pi05_pre_post_processors
+from .processor_pi05_imle_lora import make_pi05_imle_lora_pre_post_processors
 
-__all__ = ["PI05IMLELoRAConfig", "PI05IMLELoRAPolicy", "make_pi05_pre_post_processors"]
+__all__ = ["PI05IMLELoRAConfig", "PI05IMLELoRAPolicy", "make_pi05_imle_lora_pre_post_processors"]
