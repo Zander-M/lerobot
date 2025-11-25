@@ -26,7 +26,7 @@ from lerobot.optim.schedulers import CosineDecayWithWarmupSchedulerConfig
 @dataclass
 class PI05IMLEConfig(PreTrainedConfig):
     paligemma_variant: str = "gemma_2b"
-    action_expert_variant: str = "imle"
+    action_expert_variant: str = "gemma_300m"
     dtype: str = "float32"  # Options: "bfloat16", "float32"
 
     n_obs_steps: int = 1
@@ -36,8 +36,8 @@ class PI05IMLEConfig(PreTrainedConfig):
     # Shorter state and action vectors will be padded to these dimensions
     max_state_dim: int = 32
     max_action_dim: int = 32
+    # TODO: add noise dim.
 
-    # TODO: change to IMLE params
     # Flow matching parameters: see openpi `PI0Pytorch`
     num_inference_steps: int = 10
     time_sampling_beta_alpha: float = 1.5
@@ -85,7 +85,6 @@ class PI05IMLEConfig(PreTrainedConfig):
     tokenizer_max_length: int = 200  # see openpi `__post_init__`
 
     def __post_init__(self):
-    # TODO : modify this part to IMLE
         super().__post_init__()
 
         # Validate configuration

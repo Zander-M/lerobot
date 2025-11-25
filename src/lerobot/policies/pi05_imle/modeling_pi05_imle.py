@@ -49,8 +49,6 @@ from lerobot.utils.constants import (
     OPENPI_ATTENTION_MASK_VALUE,
 )
 
-from lerobot.policies.pi05_imle.imle import GeneratorConditionalUnet1D # Action Expert
-
 
 def get_safe_dtype(target_dtype, device_type):
     """Get a safe dtype for the given device type."""
@@ -294,14 +292,6 @@ class GemmaConfig:  # see openpi `gemma.py: Config`
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
 
-class IMLEConfig:
-    """Configuration for GeneratorConditionalUnet1D model"""
-    def __init__(self, input_dims, global_cond_dim, down_dims, kernel_size, n_groups):
-        self.input_dims = input_dims 
-        self.global_cond_dim = global_cond_dim # This should match paligemma2b output
-        self.down_dims = down_dims
-        self.kernel_size = kernel_size 
-        self.n_groups = n_groups
 
 def get_gemma_config(variant: str) -> GemmaConfig:  # see openpi `gemma.py: get_config`
     """Returns config for specified gemma variant."""
@@ -323,13 +313,8 @@ def get_gemma_config(variant: str) -> GemmaConfig:  # see openpi `gemma.py: get_
             num_kv_heads=1,
             head_dim=256,
         )
-
     else:
         raise ValueError(f"Unknown variant: {variant}")
-
-def get_imle_config() -> IMLEConfig: 
-    return IMLEConfig()
-    pass
 
 
 # TODO: rewrite this part. Make IMLE the main generation model, PaliGemma just provides the context.
@@ -369,7 +354,6 @@ class PaliGemmaWithExpertModel(
         vlm_config_hf.vision_config.projector_hidden_act = "gelu_fast"
         vlm_config_hf.vision_config.torch_dtype = "float32"
 
-        # TODO: change the action_expert to a Conditional IMLE model
         action_expert_config_hf = CONFIG_MAPPING["gemma"](
             head_dim=action_expert_config.head_dim,
             hidden_size=action_expert_config.width,
@@ -385,9 +369,8 @@ class PaliGemmaWithExpertModel(
         )
 
         self.paligemma = PaliGemmaForConditionalGeneration(config=vlm_config_hf)
-        # TODO: Change to Conditional IMLE Model here based on IMLEConfig
-        self.imle_expert = GemmaForCausalLM(config=action_expert_config_hf)
-        self.imle_expert.model.embed_tokens = None
+        self.gemma_expert = GemmaForCausalLM(config=action_expert_config_hf)
+        self.gemma_expert.model.embed_tokens = None
 
         self.to_bfloat16_for_selected_params(precision)
 
@@ -444,8 +427,7 @@ class PaliGemmaWithExpertModel(
             prefix_output = prefix_output.last_hidden_state
             suffix_output = None
         elif inputs_embeds[0] is None:
-            # TODO: change this part to match IMLE model interface
-            suffix_output = self.imle_expert.model.forward(
+            suffix_output = self.gemma_expert.model.forward(
                 inputs_embeds=inputs_embeds[1],
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -457,13 +439,13 @@ class PaliGemmaWithExpertModel(
             prefix_output = None
             prefix_past_key_values = None
         else:
-            models = [self.paligemma.language_model, self.imle_expert.model]
+            models = [self.paligemma.language_model, self.gemma_expert.model]
             num_layers = self.paligemma.config.text_config.num_hidden_layers
 
             # Check if gradient checkpointing is enabled for any of the models
             use_gradient_checkpointing = (
-                hasattr(self.imle_expert.model, "gradient_checkpointing")
-                and self.imle_expert.model.gradient_checkpointing
+                hasattr(self.gemma_expert.model, "gradient_checkpointing")
+                and self.gemma_expert.model.gradient_checkpointing
                 and self.training
             ) or (hasattr(self, "gradient_checkpointing") and self.gradient_checkpointing and self.training)
 
@@ -480,7 +462,7 @@ class PaliGemmaWithExpertModel(
                         use_reentrant=False,
                         preserve_rng_state=False,
                         paligemma=self.paligemma,
-                        gemma_expert=self.imle_expert,
+                        gemma_expert=self.gemma_expert,
                     )
                 else:
                     inputs_embeds = compute_layer_complete(
@@ -490,7 +472,7 @@ class PaliGemmaWithExpertModel(
                         position_ids,
                         adarms_cond,
                         paligemma=self.paligemma,
-                        gemma_expert=self.imle_expert,
+                        gemma_expert=self.gemma_expert,
                     )
 
             # final norm
@@ -520,7 +502,6 @@ class PaliGemmaWithExpertModel(
         return [prefix_output, suffix_output], prefix_past_key_values
 
 
-# TODO: modify this 
 class PI05IMLEPytorch(nn.Module):  # modified from openpi `PI0Pytorch`
     """Core PI05 + IMLE PyTorch model."""
 
@@ -567,7 +548,7 @@ class PI05IMLEPytorch(nn.Module):  # modified from openpi `PI0Pytorch`
         self.gradient_checkpointing_enabled = True
         self.paligemma_with_expert.paligemma.language_model.gradient_checkpointing = True
         self.paligemma_with_expert.paligemma.vision_tower.gradient_checkpointing = True
-        self.paligemma_with_expert.imle_expert.model.gradient_checkpointing = True
+        self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = True
         logging.info("Enabled gradient checkpointing for PI05Pytorch model")
 
     def gradient_checkpointing_disable(self):
@@ -575,7 +556,7 @@ class PI05IMLEPytorch(nn.Module):  # modified from openpi `PI0Pytorch`
         self.gradient_checkpointing_enabled = False
         self.paligemma_with_expert.paligemma.language_model.gradient_checkpointing = False
         self.paligemma_with_expert.paligemma.vision_tower.gradient_checkpointing = False
-        self.paligemma_with_expert.imle_expert.model.gradient_checkpointing = False
+        self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = False
         logging.info("Disabled gradient checkpointing for PI05Pytorch model")
 
     def _apply_checkpoint(self, func, *args, **kwargs):
@@ -825,7 +806,7 @@ class PI05IMLEPytorch(nn.Module):  # modified from openpi `PI0Pytorch`
         position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
 
         full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
-        self.paligemma_with_expert.imle_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
+        self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
 
         outputs_embeds, _ = self.paligemma_with_expert.forward(
             attention_mask=full_att_2d_masks_4d,
@@ -846,7 +827,7 @@ class PI05IMLEPolicy(PreTrainedPolicy):
     """PI05 Policy for LeRobot."""
 
     config_class = PI05IMLEConfig
-    name = "pi05"
+    name = "pi05_imle"
 
     def __init__(
         self,
@@ -861,7 +842,7 @@ class PI05IMLEPolicy(PreTrainedPolicy):
         self.config = config
 
         # Initialize the core PI05 model
-        self.model = PI05Pytorch(config)
+        self.model = PI05IMLEPytorch(config)
 
         # Enable gradient checkpointing if requested
         if config.gradient_checkpointing:

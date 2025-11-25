@@ -28,19 +28,17 @@ def build_checkpoint(pretrained_path: str, output_path: str) -> None:
 
     policy = PI05IMLEPolicy.from_pretrained(pretrained_ckpt, 
                                                 config=config, 
-                                                strict=not config.use_lora)
+                                               )
     policy.save_pretrained(output_dir)
-    print(f"LoRA-ready checkpoint saved to {output_path}")
+    print(f"IMLE checkpoint saved to {output_path}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Build PI05IMLELoRA checkpoint.")
     parser.add_argument("--pretrained_path", type=str, required=True)
     parser.add_argument("--output_path", type=str, required=True)
-    parser.add_argument("--lora_config_path", type=str, required=True)
     args = parser.parse_args()
     build_checkpoint(
        pretrained_path=args.pretrained_path,
        output_path=args.output_path, 
-       lora_config_path=args.lora_config_path
     )
 
