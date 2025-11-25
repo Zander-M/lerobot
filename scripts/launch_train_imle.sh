@@ -12,8 +12,8 @@ export TS=$(date +"%Y%m%d-%H%M%S")
 conda run --no-capture-output -n lerobot lerobot-train\
   --dataset.repo_id=libero \
   --dataset.root=/localhome/zma40/Desktop/project/generative_models_course_project/dataset/libero \
-  --policy.type=imle_policy\
-  --output_dir=outputs/imle_policy_${TS} \
+  --policy.type=imle_policy \
+  --output_dir=outputs/train/imle_policy_${TS} \
   --policy.push_to_hub=false \
   --policy.device=cuda \
   --batch_size=128 \
