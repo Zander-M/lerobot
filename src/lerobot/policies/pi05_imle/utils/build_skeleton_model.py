@@ -25,7 +25,7 @@ def build_checkpoint(pretrained_path: str, output_path: str) -> None:
 
     config = PI05IMLEConfig(**cfg_dict)
 
-    policy = PI05IMLEPolicy.from_pretrained(pretrained_ckpt, 
+    policy = PI05IMLEPolicy.from_pi05(pretrained_ckpt, 
                                                 config=config, 
                                                )
     policy.save_pretrained(output_dir)

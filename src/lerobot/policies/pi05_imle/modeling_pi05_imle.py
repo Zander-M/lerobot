@@ -760,15 +760,24 @@ class PI05IMLEPytorch(nn.Module):  # modified from openpi `PI0Pytorch`
 
         # Generate action chunk based on condition (past_key_values)
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(noise)
-        suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
-        suffix_position_ids = torch.cumsum(suffix_pad_masks, dim=1) -1
 
-        suffix_att_2d_masks_4d= self._prepare_attention_masks_4d(suffix_att_2d_masks)
+        suffix_len = suffix_pad_masks.shape[1]
+        batch_size = prefix_pad_masks.shape[0]
+        prefix_len = prefix_pad_masks.shape[1]
+
+        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
+        suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
+        full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
+
+        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+        position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+
+        full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
         self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
 
         outputs_embeds, _ = self.paligemma_with_expert.forward(
-            attention_mask=suffix_att_2d_masks_4d,
-            position_ids=suffix_position_ids,
+            attention_mask=full_att_2d_masks_4d,
+            position_ids=position_ids,
             past_key_values=past_key_values,
             inputs_embeds=[None, suffix_embs],
             use_cache=False,
@@ -779,6 +788,7 @@ class PI05IMLEPytorch(nn.Module):  # modified from openpi `PI0Pytorch`
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         suffix_out = suffix_out.to(dtype=torch.float32)
         return self.action_out_proj(suffix_out)
+
 
 class PI05IMLEPolicy(PreTrainedPolicy):
     """PI05 Policy for LeRobot."""
@@ -808,6 +818,142 @@ class PI05IMLEPolicy(PreTrainedPolicy):
         self.model.to(config.device)
 
         self.reset()
+    
+    @classmethod
+    def from_pi05(
+        cls: builtins.type[T],
+        pretrained_name_or_path: str | Path,
+        *,
+        config: PreTrainedConfig | None = None,
+        force_download: bool = False,
+        resume_download: bool | None = None,
+        proxies: dict | None = None,
+        token: str | bool | None = None,
+        cache_dir: str | Path | None = None,
+        local_files_only: bool = False,
+        revision: str | None = None,
+        strict: bool = True,
+        **kwargs,
+    ) -> T:
+        """
+            Build an IMLE compatible model from PI05 checkpoint.
+            We load the PaLiGemma2B parameters only, and initialize the 
+            GemmaCausualLM model parameters randomly.
+            This prevents the AdaRMSNorm parameter mismatch problem.
+        """
+        print(
+            """
+                This function creates a model where we only load the PaLIGemma2B
+                parameters and randomly initialize the Gemma Expert model.
+                This should create a skeleton model for training the Gemma
+                Expert only.
+            """ 
+        )
+        if pretrained_name_or_path is None:
+            raise ValueError("pretrained_name_or_path is required")
+
+        # Use provided config if available, otherwise create default config
+        if config is None:
+            config = PreTrainedConfig.from_pretrained(
+                pretrained_name_or_path=pretrained_name_or_path,
+                force_download=force_download,
+                resume_download=resume_download,
+                proxies=proxies,
+                token=token,
+                cache_dir=cache_dir,
+                local_files_only=local_files_only,
+                revision=revision,
+                **kwargs,
+            )
+
+        # Initialize model without loading weights
+        # Check if dataset_stats were provided in kwargs
+        model = cls(config, **kwargs)
+
+        # Now manually load and remap the state dict
+        try:
+            # Try to load the pytorch_model.bin or model.safetensors file
+            print(f"Loading model from: {pretrained_name_or_path}")
+            try:
+                from transformers.utils import cached_file
+
+                # Try safetensors first
+                resolved_file = cached_file(
+                    pretrained_name_or_path,
+                    "model.safetensors",
+                    cache_dir=kwargs.get("cache_dir"),
+                    force_download=kwargs.get("force_download", False),
+                    resume_download=kwargs.get("resume_download"),
+                    proxies=kwargs.get("proxies"),
+                    use_auth_token=kwargs.get("use_auth_token"),
+                    revision=kwargs.get("revision"),
+                    local_files_only=kwargs.get("local_files_only", False),
+                )
+                from safetensors.torch import load_file
+
+                original_state_dict = load_file(resolved_file)
+                print("✓ Loaded state dict from model.safetensors")
+            except Exception as e:
+                print(f"Could not load state dict from remote files: {e}")
+                print("Returning model without loading pretrained weights")
+                return model
+
+            # First, fix any key differences # see openpi `model.py, _fix_pytorch_state_dict_keys`
+            fixed_state_dict = model._fix_pytorch_state_dict_keys(original_state_dict, model.config)
+
+            # Then add "model." prefix for all keys that don't already have it
+            remapped_state_dict = {}
+            remap_count = 0
+
+            for key, value in fixed_state_dict.items():
+                if not key.startswith("model."):
+                    new_key = f"model.{key}"
+                    remapped_state_dict[new_key] = value
+                    remap_count += 1
+                    if remap_count <= 10:  # Only print first 10 to avoid spam
+                        print(f"Remapped: {key} -> {new_key}")
+                else:
+                    remapped_state_dict[key] = value
+
+            # Filter the state_dict
+            filtered_state_dict = {
+                k: v for k, v in remapped_state_dict.items()
+                if k.startswith("model.paligemma")
+            }
+
+            if remap_count > 0:
+                print(f"Remapped {remap_count} state dict keys")
+
+            # Load the remapped state dict into the model
+            missing_keys, unexpected_keys = model.load_state_dict(filtered_state_dict, strict=False)
+
+            if missing_keys:
+                print(f"Missing keys when loading state dict: {len(missing_keys)} keys")
+                if len(missing_keys) <= 5:
+                    for key in missing_keys:
+                        print(f"  - {key}")
+                else:
+                    for key in missing_keys[:5]:
+                        print(f"  - {key}")
+                    print(f"  ... and {len(missing_keys) - 5} more")
+
+            if unexpected_keys:
+                print(f"Unexpected keys when loading state dict: {len(unexpected_keys)} keys")
+                if len(unexpected_keys) <= 5:
+                    for key in unexpected_keys:
+                        print(f"  - {key}")
+                else:
+                    for key in unexpected_keys[:5]:
+                        print(f"  - {key}")
+                    print(f"  ... and {len(unexpected_keys) - 5} more")
+
+            if not missing_keys and not unexpected_keys:
+                print("All keys loaded successfully!")
+
+        except Exception as e:
+            print(f"Warning: Could not remap state dict keys: {e}")
+
+        return model
 
     @classmethod
     def from_pretrained(
