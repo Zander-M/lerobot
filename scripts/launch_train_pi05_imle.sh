@@ -9,7 +9,7 @@ TS=$(date +"%Y%m%d-%H%M%S")
 export TS
 
 # Train Config
-export DATASET_ROOT=/localhome/zma40/Desktop/project/generative_models_course_project/dataset/libero
+export DATASET_ROOT=../data/dataset/libero
 export STEPS=100
 export LOG_FREQ=10
 

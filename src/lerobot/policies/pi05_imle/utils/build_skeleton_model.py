@@ -25,7 +25,6 @@ def build_checkpoint(pretrained_path: str, output_path: str) -> None:
 
     config = PI05IMLEConfig(**cfg_dict)
 
-
     policy = PI05IMLEPolicy.from_pretrained(pretrained_ckpt, 
                                                 config=config, 
                                                )
@@ -33,7 +32,7 @@ def build_checkpoint(pretrained_path: str, output_path: str) -> None:
     print(f"IMLE checkpoint saved to {output_path}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Build PI05IMLELoRA checkpoint.")
+    parser = argparse.ArgumentParser(description="Build PI05IMLE checkpoint.")
     parser.add_argument("--pretrained_path", type=str, required=True)
     parser.add_argument("--output_path", type=str, required=True)
     args = parser.parse_args()

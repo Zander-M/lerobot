@@ -21,10 +21,14 @@ from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from lerobot.optim.optimizers import AdamWConfig
 from lerobot.optim.schedulers import CosineDecayWithWarmupSchedulerConfig
 
+# Our model is adapted from PI05 model and use the same network architecture. 
+# We therefore inherents the config
+from lerobot.policies.pi05 import PI05Config
+
 
 @PreTrainedConfig.register_subclass("pi05_imle")
 @dataclass
-class PI05IMLEConfig(PreTrainedConfig):
+class PI05IMLEConfig(PI05Config):
     paligemma_variant: str = "gemma_2b"
     action_expert_variant: str = "gemma_300m"
     dtype: str = "float32"  # Options: "bfloat16", "float32"
