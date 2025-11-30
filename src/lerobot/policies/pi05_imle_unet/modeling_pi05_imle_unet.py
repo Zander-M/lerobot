@@ -36,13 +36,9 @@ from lerobot.utils.import_utils import _transformers_available
 # Conditional import for type checking and lazy loading
 if TYPE_CHECKING or _transformers_available:
     from transformers.models.auto import CONFIG_MAPPING
-    from transformers.models.gemma import modeling_gemma
-    from transformers.models.gemma.modeling_gemma import GemmaForCausalLM
     from transformers.models.paligemma.modeling_paligemma import PaliGemmaForConditionalGeneration
 else:
     CONFIG_MAPPING = None
-    modeling_gemma = None
-    GemmaForCausalLM = None
     PaliGemmaForConditionalGeneration = None
 
 from lerobot.configs.policies import PreTrainedConfig
@@ -211,81 +207,6 @@ def resize_with_pad_torch(  # see openpi `resize_with_pad_torch` (exact copy)
 
     return padded_images
 
-
-# Define the complete layer computation function for gradient checkpointing
-def compute_layer_complete(
-    layer_idx, inputs_embeds, attention_mask, position_ids, adarms_cond, paligemma, gemma_expert
-):
-    models = [paligemma.language_model, gemma_expert.model]
-    query_states = []
-    key_states = []
-    value_states = []
-    gates = []
-    for i, hidden_states in enumerate(inputs_embeds):
-        layer = models[i].layers[layer_idx]
-        hidden_states, gate = layer.input_layernorm(hidden_states, cond=adarms_cond[i])  # noqa: PLW2901
-        gates.append(gate)
-        input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
-        query_state = layer.self_attn.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        key_state = layer.self_attn.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        value_state = layer.self_attn.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        query_states.append(query_state)
-        key_states.append(key_state)
-        value_states.append(value_state)
-    # Concatenate and process attention
-    query_states = torch.cat(query_states, dim=2)
-    key_states = torch.cat(key_states, dim=2)
-    value_states = torch.cat(value_states, dim=2)
-    dummy_tensor = torch.zeros(
-        query_states.shape[0],
-        query_states.shape[2],
-        query_states.shape[-1],
-        device=query_states.device,
-        dtype=query_states.dtype,
-    )
-    cos, sin = paligemma.model.language_model.rotary_emb(dummy_tensor, position_ids)
-    query_states, key_states = modeling_gemma.apply_rotary_pos_emb(
-        query_states, key_states, cos, sin, unsqueeze_dim=1
-    )
-    batch_size = query_states.shape[0]
-    scaling = paligemma.language_model.layers[layer_idx].self_attn.scaling
-    # Attention computation
-    att_output, _ = modeling_gemma.eager_attention_forward(
-        paligemma.language_model.layers[layer_idx].self_attn,
-        query_states,
-        key_states,
-        value_states,
-        attention_mask,
-        scaling,
-    )
-    # Get head_dim from the current layer, not from the model
-    head_dim = paligemma.language_model.layers[layer_idx].self_attn.head_dim
-    att_output = att_output.reshape(batch_size, -1, 1 * 8 * head_dim)
-    # Process layer outputs
-    outputs_embeds = []
-    start_pos = 0
-    for i, hidden_states in enumerate(inputs_embeds):
-        layer = models[i].layers[layer_idx]
-        end_pos = start_pos + hidden_states.shape[1]
-        if att_output.dtype != layer.self_attn.o_proj.weight.dtype:
-            att_output = att_output.to(layer.self_attn.o_proj.weight.dtype)
-        out_emb = layer.self_attn.o_proj(att_output[:, start_pos:end_pos])
-        # first residual
-        out_emb = modeling_gemma._gated_residual(hidden_states, out_emb, gates[i])  # noqa: SLF001
-        after_first_residual = out_emb.clone()
-        out_emb, gate = layer.post_attention_layernorm(out_emb, cond=adarms_cond[i])
-        # Convert to bfloat16 if the next layer (mlp) uses bfloat16
-        if layer.mlp.up_proj.weight.dtype == torch.bfloat16:
-            out_emb = out_emb.to(dtype=torch.bfloat16)
-        out_emb = layer.mlp(out_emb)
-        # second residual
-        out_emb = modeling_gemma._gated_residual(after_first_residual, out_emb, gate)  # noqa: SLF001
-        outputs_embeds.append(out_emb)
-        start_pos = end_pos
-    return outputs_embeds
-
-
 class GemmaConfig:  # see openpi `gemma.py: Config`
     """Configuration for Gemma model variants."""
 
@@ -357,11 +278,9 @@ class PaliGemmaWithExpertModel(
         self,
         vlm_config,
         unet_config,
-        use_adarms=None,
+        use_adarms= False,
         precision: Literal["bfloat16", "float32"] = "bfloat16",
     ):
-        if use_adarms is None:
-            use_adarms = [False, False]
         super().__init__()
 
         vlm_config_hf = CONFIG_MAPPING["paligemma"]()
@@ -376,8 +295,8 @@ class PaliGemmaWithExpertModel(
         vlm_config_hf.text_config.hidden_activation = "gelu_pytorch_tanh"
         vlm_config_hf.text_config.torch_dtype = "float32"
         vlm_config_hf.text_config.vocab_size = 257152
-        vlm_config_hf.text_config.use_adarms = use_adarms[0]
-        vlm_config_hf.text_config.adarms_cond_dim = vlm_config.width if use_adarms[0] else None
+        vlm_config_hf.text_config.use_adarms = use_adarms
+        vlm_config_hf.text_config.adarms_cond_dim = vlm_config.width if use_adarms else None
         vlm_config_hf.vision_config.intermediate_size = 4304
         vlm_config_hf.vision_config.projection_dim = 2048
         vlm_config_hf.vision_config.projector_hidden_act = "gelu_fast"
@@ -439,7 +358,7 @@ class PI05IMLEUnetPytorch(nn.Module):  # modified from openpi `PI0Pytorch`
         self.paligemma_with_expert = PaliGemmaWithExpertModel(
             paligemma_config,
             unet_config,
-            use_adarms=[False, False], # no timestep embed, set AdaRMS to False for Gemma Expert
+            use_adarms=False , # no timestep embed, set AdaRMS to False for Gemma Expert
             precision=config.dtype,
         )
 
@@ -555,11 +474,19 @@ class PI05IMLEUnetPytorch(nn.Module):  # modified from openpi `PI0Pytorch`
         device = actions.device
 
         # Context embedding and expansion to match dimension
-        prefix_embs, _, _ = self.embed_prefix(images, img_masks, tokens, masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
         prefix_embs = prefix_embs.repeat_interleave(S, dim=0)
+        prefix_pad_masks = prefix_pad_masks.repeat_interleave(S, dim=0)
+        prefix_att_masks = prefix_att_masks.repeat_interleave(S, dim=0)
 
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+
+        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
         prefix_output = self.paligemma_with_expert.paligemma.language_model.forward(
             inputs_embeds=prefix_embs,
+            attention_mask=prefix_att_2d_masks_4d,
+            position_ids=prefix_position_ids,
             use_cache=False
         )
 
@@ -578,6 +505,7 @@ class PI05IMLEUnetPytorch(nn.Module):  # modified from openpi `PI0Pytorch`
 
         sampled_actions = sampled_actions_flat.reshape(B, S, T, D)
 
+        # rs_imle_loss from IMLE Policy
         loss, wandb_log = rs_imle_loss(actions, sampled_actions, epsilon=self.config.imle_epsilon)
         return loss, wandb_log 
 
@@ -590,16 +518,21 @@ class PI05IMLEUnetPytorch(nn.Module):  # modified from openpi `PI0Pytorch`
         T = self.config.chunk_size 
         D = self.config.max_action_dim
         
-        prefix_embs, _, _= self.embed_prefix(images, img_masks, tokens, masks)
-
         # Generating conditional embedded from prefix_embs 
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        
+        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
         prefix_output = self.paligemma_with_expert.paligemma.language_model.forward(
             inputs_embeds=prefix_embs,
+            attention_mask=prefix_att_2d_masks_4d,
+            position_ids=prefix_position_ids,
             use_cache=False
         )
 
         prefix_hidden = prefix_output.last_hidden_state
-        global_cond = prefix_hidden[:, -1, :]
+        global_cond = prefix_hidden[:, -1, :] # use last token as cond embedding. Could Change to mean pooling later for comparison.
 
         # IMLE random samples
         if noise is None: 
@@ -625,7 +558,7 @@ class PI05IMLEUnetPolicy(PreTrainedPolicy):
     """PI05 IMLE Policy with Unet1D action expert for LeRobot."""
 
     config_class = PI05IMLEUnetConfig
-    name = "pi05_imle"
+    name = "pi05_imle_unet"
 
     def __init__(
         self,
@@ -647,7 +580,6 @@ class PI05IMLEUnetPolicy(PreTrainedPolicy):
             self.model.gradient_checkpointing_enable()
 
         self.model.to(config.device)
-
         self.reset()
     
     @classmethod
@@ -676,7 +608,7 @@ class PI05IMLEUnetPolicy(PreTrainedPolicy):
             """
                 This function creates a model where we only load the PaLIGemma2B
                 parameters and randomly initialize the Gemma Expert model.
-                This should create a skeleton model for training the Gemma
+                This should create a skeleton model for training the Unet 
                 Expert only.
             """ 
         )
@@ -923,46 +855,6 @@ class PI05IMLEUnetPolicy(PreTrainedPolicy):
 
         for key, value in state_dict.items():
             new_key = key
-
-            # Handle layer norm structure changes: .weight -> .dense.weight + .dense.bias
-            # For gemma expert layers
-            if re.match(
-                r"paligemma_with_expert\.gemma_expert\.model\.layers\.\d+\.(input_layernorm|post_attention_layernorm)\.weight",
-                key,
-            ):
-                # Check if the model actually has adaRMS enabled for the expert
-                expert_uses_adarms = getattr(
-                    self.model.paligemma_with_expert.gemma_expert.config, "use_adarms", False
-                )
-                if expert_uses_adarms:
-                    logging.warning(f"Skipping layer norm key (adaRMS mismatch): {key}")
-                    continue
-
-            if re.match(r"paligemma_with_expert\.gemma_expert\.model\.norm\.weight", key):
-                # Check if the model actually has adaRMS enabled for the expert
-                expert_uses_adarms = getattr(
-                    self.model.paligemma_with_expert.gemma_expert.config, "use_adarms", False
-                )
-                if expert_uses_adarms:
-                    logging.warning(f"Skipping norm key (adaRMS mismatch): {key}")
-                    continue
-
-            # Handle MLP naming changes for pi05
-            # pi05 model expects time_mlp_*, but checkpoint might have action_time_mlp_*
-            if key.startswith("action_time_mlp_in."):
-                new_key = key.replace("action_time_mlp_in.", "time_mlp_in.")
-            elif key.startswith("action_time_mlp_out."):
-                new_key = key.replace("action_time_mlp_out.", "time_mlp_out.")
-            # Also handle state_proj which shouldn't exist in pi05
-            if key.startswith("state_proj."):
-                logging.warning(f"Skipping state_proj key in pi05 mode: {key}")
-                continue
-
-            # Handle vision tower embedding layer potential differences
-            if "patch_embedding" in key:
-                # Some checkpoints might have this, but current model expects different structure
-                logging.warning(f"Vision embedding key might need handling: {key}")
-
             fixed_state_dict[new_key] = value
 
         return fixed_state_dict
@@ -1092,9 +984,6 @@ class PI05IMLEUnetPolicy(PreTrainedPolicy):
         losses, wandb_log = self.model.forward(images, img_masks, tokens, masks, actions)
 
         # Truncate losses to actual action dimensions
-        # original_action_dim = self.config.output_features[ACTION].shape[0]
-        # losses = losses[:, :, :original_action_dim]
-
         loss = losses.mean()
 
         return loss, wandb_log
