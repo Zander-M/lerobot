@@ -35,6 +35,7 @@ from lerobot.policies.imle_policy.configuration_imle_policy import IMLEConfig
 from lerobot.policies.pi0.configuration_pi0 import PI0Config
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
 from lerobot.policies.pi05_imle.configuration_pi05_imle import PI05IMLEConfig
+from lerobot.policies.pi05_imle_unet.configuration_pi05_imle_unet import PI05IMLEUnetConfig
 from lerobot.policies.pi05_imle_lora.configuration_pi05_imle_lora import PI05IMLELoRAConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.sac.configuration_sac import SACConfig
@@ -107,6 +108,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from lerobot.policies.pi05_imle_lora.modeling_pi05_imle_lora import PI05IMLELoRAPolicy as PI05IMLELoRAPolicy
 
         return PI05IMLELoRAPolicy
+    elif name == "pi05_imle_unet":
+        from lerobot.policies.pi05_imle_unet.modeling_pi05_imle_unet import PI05IMLEUnetPolicy as PI05IMLEUnetPolicy
+
+        return PI05IMLEUnetPolicy
     elif name == "sac":
         from lerobot.policies.sac.modeling_sac import SACPolicy
 
@@ -164,6 +169,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return PI05IMLEConfig(**kwargs)
     elif policy_type == "pi05_imle_lora":
         return PI05IMLELoRAConfig(**kwargs)
+    elif policy_type == "pi05_imle_unet":
+        return PI05IMLEUnetConfig(**kwargs)
     elif policy_type == "sac":
         return SACConfig(**kwargs)
     elif policy_type == "smolvla":
@@ -332,6 +339,14 @@ def make_pre_post_processors(
         from lerobot.policies.pi05_imle.processor_pi05_imle import make_pi05_imle_pre_post_processors
 
         processors = make_pi05_imle_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, PI05IMLEUnetConfig):
+        from lerobot.policies.pi05_imle_unet.processor_pi05_imle_unet import make_pi05_imle_unet_pre_post_processors
+
+        processors = make_pi05_imle_unet_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )
