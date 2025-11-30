@@ -509,7 +509,7 @@ class PI05IMLEPytorch(nn.Module):  # modified from openpi `PI0Pytorch`
         self.paligemma_with_expert = PaliGemmaWithExpertModel(
             paligemma_config,
             action_expert_config,
-            use_adarms=[False, False],
+            use_adarms=[False, False], # no timestep embed, set AdaRMS to False for Gemma Expert
             precision=config.dtype,
         )
 
@@ -545,8 +545,9 @@ class PI05IMLEPytorch(nn.Module):  # modified from openpi `PI0Pytorch`
 
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory optimization."""
+        # Since we don't touch paligemma model, paligemma gradient checkpointing is disabled for faster training
         self.gradient_checkpointing_enabled = True
-        self.paligemma_with_expert.paligemma.language_model.gradient_checkpointing = True
+        self.paligemma_with_expert.paligemma.language_model.gradient_checkpointing = True 
         self.paligemma_with_expert.paligemma.vision_tower.gradient_checkpointing = True
         self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = True
         logging.info("Enabled gradient checkpointing for PI05Pytorch model")
