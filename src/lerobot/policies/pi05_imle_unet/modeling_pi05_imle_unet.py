@@ -349,6 +349,8 @@ class PaliGemmaWithExpertModel(
     """
         PaliGemma model with action expert (IMLE) for PI05.
         This version uses Unet as the action expert.
+        Since no branching needed during forward
+        we remove the forward function
     """
 
     def __init__(
@@ -415,35 +417,6 @@ class PaliGemmaWithExpertModel(
     def embed_language_tokens(self, tokens: torch.Tensor):
         return self.paligemma.language_model.embed_tokens(tokens)
 
-    def forward(
-        self,
-        prefix_embs: torch.FloatTensor | None = None,
-        noise_flat: torch.FloatTensor | None = None,
-        attention_mask: torch.Tensor | None = None,
-        position_ids: torch.LongTensor | None = None,
-        past_key_values: list[torch.FloatTensor] | None = None,
-        use_cache: bool | None = None,
-    ):
-        """
-            Updated forward function using Unet
-        """
-        prefix_output = self.paligemma.language_model.forward(
-            inputs_embeds=prefix_embs,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            use_cache=use_cache
-        )
-        prefix_output = prefix_output.last_hidden_state
-
-        global_cond = prefix_output[:, -1, :] # global conditioning for Unet (B*S, hidden_dim)
-
-        sampled_actions_flat = self.unet_expert(
-            global_cond=global_cond,
-            sample=noise_flat,
-        ) # (B*S, T, D)
-        return sampled_actions_flat
-
 
 class PI05IMLEUnetPytorch(nn.Module):  # modified from openpi `PI0Pytorch`
     """Core PI05 + IMLE + Unet PyTorch model."""
@@ -500,7 +473,6 @@ class PI05IMLEUnetPytorch(nn.Module):  # modified from openpi `PI0Pytorch`
         self.gradient_checkpointing_enabled = True
         self.paligemma_with_expert.paligemma.language_model.gradient_checkpointing = True 
         self.paligemma_with_expert.paligemma.vision_tower.gradient_checkpointing = True
-        self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = True
         logging.info("Enabled gradient checkpointing for PI05Pytorch model")
 
     def gradient_checkpointing_disable(self):
@@ -508,7 +480,6 @@ class PI05IMLEUnetPytorch(nn.Module):  # modified from openpi `PI0Pytorch`
         self.gradient_checkpointing_enabled = False
         self.paligemma_with_expert.paligemma.language_model.gradient_checkpointing = False
         self.paligemma_with_expert.paligemma.vision_tower.gradient_checkpointing = False
-        self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = False
         logging.info("Disabled gradient checkpointing for PI05Pytorch model")
 
     def _apply_checkpoint(self, func, *args, **kwargs):
@@ -576,42 +547,6 @@ class PI05IMLEUnetPytorch(nn.Module):  # modified from openpi `PI0Pytorch`
 
         return embs, pad_masks, att_masks
 
-    def embed_suffix(self, noisy_actions):
-        """Embed noisy_actions for Expert Gemma processing."""
-        embs = []
-        pad_masks = []
-
-        # Project actions → model dimension
-        def action_proj_func(noisy_actions):
-            return self.action_in_proj(noisy_actions)
-
-        action_emb = self._apply_checkpoint(action_proj_func, noisy_actions)
-        embs.append(action_emb)
-
-        B, L = action_emb.shape[:2]
-        device = noisy_actions.device
-
-        # All action tokens are valid
-        pad_mask = torch.ones(B, L, dtype=torch.bool, device=device)
-        pad_masks.append(pad_mask)
-
-        base = torch.tensor(
-            [1] + [0] * (self.config.chunk_size - 1),
-            dtype=torch.bool,
-            device=device
-        )  # (L,)
-
-        # Expand to batch
-        att_masks = base.unsqueeze(0).expand(B, L)  # (B, L)
-
-        # Final assembly
-        embs = torch.cat(embs, dim=1)
-        pad_masks = torch.cat(pad_masks, dim=1)
-
-        adarms_cond = None
-        return embs, pad_masks, att_masks, adarms_cond
-
-
     def forward(self, images, img_masks, tokens, masks, actions) -> tuple[Tensor, dict[str, Any]]:
         """Do a full training forward pass and compute the loss."""
 
@@ -620,59 +555,27 @@ class PI05IMLEUnetPytorch(nn.Module):  # modified from openpi `PI0Pytorch`
         device = actions.device
 
         # Context embedding and expansion to match dimension
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
+        prefix_embs, _, _ = self.embed_prefix(images, img_masks, tokens, masks)
         prefix_embs = prefix_embs.repeat_interleave(S, dim=0)
-        prefix_pad_masks = prefix_pad_masks.repeat_interleave(S, dim=0)
-        prefix_att_masks = prefix_att_masks.repeat_interleave(S, dim=0)
+
+        prefix_output = self.paligemma_with_expert.paligemma.language_model.forward(
+            inputs_embeds=prefix_embs,
+            use_cache=False
+        )
+
+        prefix_hidden = prefix_output.last_hidden_state
+        global_cond = prefix_hidden[:, -1, :]
 
         # IMLE random samples
         noise_shape = (B, S, T, D)
-
         noise = self.sample_noise(noise_shape, device)
-
         noise_flat = noise.reshape(B*S, T, D)
 
-        # For one step generation, no time dim needed. Adding this for suffix embedding
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(noise_flat)
-
-        # dtype fix if needed
-        if (
-            self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
-            == torch.bfloat16
-        ):
-            suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
-            prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
-
-        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
-        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
-
-        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
-        position_ids = torch.cumsum(pad_masks, dim=1) - 1
-
-        att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
-
-        def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
-            (_, suffix_out), _ = self.paligemma_with_expert.forward(
-                attention_mask=att_2d_masks_4d,
-                position_ids=position_ids,
-                past_key_values=None,
-                inputs_embeds=[prefix_embs, suffix_embs],
-                use_cache=False,
-                adarms_cond=[None, None], # no adarms_cond
-            )
-            return suffix_out
-
-        suffix_out = self._apply_checkpoint(
-            forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
+        sampled_actions_flat = self.paligemma_with_expert.unet_expert(
+            global_cond=global_cond,
+            sample = noise_flat
         )
 
-        suffix_out = suffix_out[:, -self.config.chunk_size :]
-        suffix_out = suffix_out.to(dtype=torch.float32)
-
-        def action_out_proj_func(suffix_out):
-            return self.action_out_proj(suffix_out)
-
-        sampled_actions_flat = self._apply_checkpoint(action_out_proj_func, suffix_out)
         sampled_actions = sampled_actions_flat.reshape(B, S, T, D)
 
         loss, wandb_log = rs_imle_loss(actions, sampled_actions, epsilon=self.config.imle_epsilon)
@@ -682,64 +585,40 @@ class PI05IMLEUnetPytorch(nn.Module):  # modified from openpi `PI0Pytorch`
     def sample_actions(self, images, img_masks, tokens, masks, noise=None) -> Tensor:
         """Do a full inference forward and compute the action."""
 
-        bsize = tokens.shape[0]
         device = tokens.device
+        B = tokens.shape[0]
+        T = self.config.chunk_size 
+        D = self.config.max_action_dim
+        
+        prefix_embs, _, _= self.embed_prefix(images, img_masks, tokens, masks)
 
-        if noise is None:
-            # Sample noise with padded dimension as expected by action_in_proj
-            actions_shape = (
-                bsize,
-                self.config.chunk_size,
-                self.config.max_action_dim,
-            )  # Use config max_action_dim for internal processing
-            noise = self.sample_noise(actions_shape, device)
-
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
-        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-
-        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
-        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
-
-        # Generating conditional embedded from prefix_embs (past_key_values)
-        _, past_key_values = self.paligemma_with_expert.forward(
-            attention_mask=prefix_att_2d_masks_4d,
-            position_ids=prefix_position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
-            use_cache=True,
+        # Generating conditional embedded from prefix_embs 
+        prefix_output = self.paligemma_with_expert.paligemma.language_model.forward(
+            inputs_embeds=prefix_embs,
+            use_cache=False
         )
 
-        # Generate action chunk based on condition (past_key_values)
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(noise)
+        prefix_hidden = prefix_output.last_hidden_state
+        global_cond = prefix_hidden[:, -1, :]
 
-        suffix_len = suffix_pad_masks.shape[1]
-        batch_size = prefix_pad_masks.shape[0]
-        prefix_len = prefix_pad_masks.shape[1]
+        # IMLE random samples
+        if noise is None: 
+            noise_shape = (B, T, D)
+            noise = self.sample_noise(noise_shape, device)
 
-        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
-        suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
-        full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
+        noise_flat = noise.reshape(B, T, D)
 
-        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
-        position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
-
-        full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
-        self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
-
-        outputs_embeds, _ = self.paligemma_with_expert.forward(
-            attention_mask=full_att_2d_masks_4d,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=[None, suffix_embs],
-            use_cache=False,
-            adarms_cond=[None, adarms_cond],
+        # Making sure datatype matches
+        global_cond = global_cond.to(torch.float32)
+        noise = noise.to(torch.float32)
+        
+        sampled_actions_flat = self.paligemma_with_expert.unet_expert(
+            global_cond=global_cond,
+            sample = noise_flat
         )
 
-        suffix_out = outputs_embeds[1]
-        suffix_out = suffix_out[:, -self.config.chunk_size :]
-        suffix_out = suffix_out.to(dtype=torch.float32)
-        return self.action_out_proj(suffix_out)
+        sampled_actions = sampled_actions_flat.reshape(B, T, D)
+        return sampled_actions
 
 
 class PI05IMLEUnetPolicy(PreTrainedPolicy):
