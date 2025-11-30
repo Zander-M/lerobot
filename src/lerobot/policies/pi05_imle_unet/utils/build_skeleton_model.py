@@ -11,7 +11,7 @@ from pathlib import Path
 
 from dataclasses import asdict
 from lerobot.configs.policies import PreTrainedConfig
-from lerobot.policies.pi05_imle import PI05IMLEConfig, PI05IMLEPolicy
+from lerobot.policies.pi05_imle_unet import PI05IMLEUnetConfig, PI05IMLEUnetPolicy
 
 def build_checkpoint(pretrained_path: str, output_path: str) -> None:
     pretrained_ckpt = Path(pretrained_path)
@@ -23,9 +23,9 @@ def build_checkpoint(pretrained_path: str, output_path: str) -> None:
     cfg_dict.pop("type", None)
     cfg_dict.pop("pretrained_path", None)
 
-    config = PI05IMLEConfig(**cfg_dict)
+    config = PI05IMLEUnetConfig(**cfg_dict)
 
-    policy = PI05IMLEPolicy.from_pi05(pretrained_ckpt, 
+    policy = PI05IMLEUnetPolicy.from_pi05(pretrained_ckpt, 
                                                 config=config, 
                                                )
     policy.save_pretrained(output_dir)
