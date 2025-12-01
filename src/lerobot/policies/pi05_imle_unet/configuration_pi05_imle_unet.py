@@ -25,7 +25,6 @@ from lerobot.optim.schedulers import CosineDecayWithWarmupSchedulerConfig
 
 # Our model is adapted from PI05 model and use the same network architecture. 
 # We therefore inherent the config
-from lerobot.policies.pi05 import PI05Config
 
 @dataclass
 class UnetConfig:  
@@ -38,13 +37,15 @@ class UnetConfig:
 
 @PreTrainedConfig.register_subclass("pi05_imle_unet")
 @dataclass
-class PI05IMLEUnetConfig(PI05Config):
+class PI05IMLEUnetConfig(PreTrainedConfig):
     paligemma_variant: str = "gemma_2b"
     action_expert_variant: str = "unet"
     dtype: str = "float32"  # Options: "bfloat16", "float32"
 
     n_obs_steps: int = 1
-    chunk_size: int = 50  # Number of action steps to predict, in openpi called "action_horizon"
+    # chunk_size: int = 50  # Number of action steps to predict, in openpi called "action_horizon"
+    # n_action_steps: int = 50  # Number of action steps to execute
+    chunk_size: int = 64  # Number of action steps to predict, in openpi called "action_horizon"
     n_action_steps: int = 50  # Number of action steps to execute
 
     # Shorter state and action vectors will be padded to these dimensions
@@ -111,7 +112,7 @@ class PI05IMLEUnetConfig(PI05Config):
         if self.paligemma_variant not in ["gemma_300m", "gemma_2b"]:
             raise ValueError(f"Invalid paligemma_variant: {self.paligemma_variant}")
 
-        if self.action_expert_variant not in ["gemma_300m", "gemma_2b", "unet"]:
+        if self.action_expert_variant not in ["gemma_300m", "unet"]:
             raise ValueError(f"Invalid action_expert_variant: {self.action_expert_variant}")
 
         if self.dtype not in ["bfloat16", "float32"]:

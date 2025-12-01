@@ -329,6 +329,9 @@ class PaliGemmaWithExpertModel(
         for name, param in self.named_parameters():
             if any(selector in name for selector in params_to_keep_float32):
                 param.data = param.data.to(dtype=torch.float32)
+        
+        # Keep Unet in float32
+        self.unet_expert.to(torch.float32)
 
     def embed_image(self, image: torch.Tensor):
         return self.paligemma.model.get_image_features(image)
@@ -491,16 +494,16 @@ class PI05IMLEUnetPytorch(nn.Module):  # modified from openpi `PI0Pytorch`
         )
 
         prefix_hidden = prefix_output.last_hidden_state
-        global_cond = prefix_hidden[:, -1, :]
+        # global_cond = prefix_hidden[:, -1, :]
+        global_cond = prefix_hidden.mean(dim=1) # Use mean pooling
 
         # IMLE random samples
         noise_shape = (B, S, T, D)
         noise = self.sample_noise(noise_shape, device)
-        noise_flat = noise.reshape(B*S, T, D)
 
         sampled_actions_flat = self.paligemma_with_expert.unet_expert(
             global_cond=global_cond,
-            sample = noise_flat
+            sample = noise
         )
 
         sampled_actions = sampled_actions_flat.reshape(B, S, T, D)
@@ -524,6 +527,7 @@ class PI05IMLEUnetPytorch(nn.Module):  # modified from openpi `PI0Pytorch`
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
         
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"
         prefix_output = self.paligemma_with_expert.paligemma.language_model.forward(
             inputs_embeds=prefix_embs,
             attention_mask=prefix_att_2d_masks_4d,
@@ -532,25 +536,23 @@ class PI05IMLEUnetPytorch(nn.Module):  # modified from openpi `PI0Pytorch`
         )
 
         prefix_hidden = prefix_output.last_hidden_state
-        global_cond = prefix_hidden[:, -1, :] # use last token as cond embedding. Could Change to mean pooling later for comparison.
+        # global_cond = prefix_hidden[:, -1, :] # use last token as cond embedding. Could Change to mean pooling later for comparison.
+        global_cond = prefix_hidden.mean(dim=1) # use token mean as cond embedding.
 
         # IMLE random samples
         if noise is None: 
             noise_shape = (B, T, D)
             noise = self.sample_noise(noise_shape, device)
 
-        noise_flat = noise.reshape(B, T, D)
-
         # Making sure datatype matches
         global_cond = global_cond.to(torch.float32)
         noise = noise.to(torch.float32)
         
-        sampled_actions_flat = self.paligemma_with_expert.unet_expert(
+        sampled_actions = self.paligemma_with_expert.unet_expert(
             global_cond=global_cond,
-            sample = noise_flat
+            sample = noise
         )
 
-        sampled_actions = sampled_actions_flat.reshape(B, T, D)
         return sampled_actions
 
 
@@ -607,7 +609,7 @@ class PI05IMLEUnetPolicy(PreTrainedPolicy):
         print(
             """
                 This function creates a model where we only load the PaLIGemma2B
-                parameters and randomly initialize the Gemma Expert model.
+                parameters and randomly initialize the Unet Action Expert model.
                 This should create a skeleton model for training the Unet 
                 Expert only.
             """ 
@@ -737,8 +739,8 @@ class PI05IMLEUnetPolicy(PreTrainedPolicy):
         """Override the from_pretrained method to handle key remapping and display important disclaimer."""
         print(
             
-            "The PI05 IMLE model is a direct port of the lerobot PIO5 policy implementation. \n"
-            "This model reuses the PI05 network architecture and train the action expert for IMLE objective. \n"
+            "The PI05 IMLE Unet model is a direct port of the lerobot PIO5 policy implementation. \n"
+            "This model reuses the PI05 network architecture and train the Unet action expert for IMLE objective. \n"
             "Below is the original message: \n"
             "-------------------------------- \n"
             "The PI05 model is a direct port of the OpenPI implementation. \n"
