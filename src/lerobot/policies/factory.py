@@ -35,6 +35,7 @@ from lerobot.policies.imle_policy.configuration_imle_policy import IMLEConfig
 from lerobot.policies.pi0.configuration_pi0 import PI0Config
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
 from lerobot.policies.pi05_imle.configuration_pi05_imle import PI05IMLEConfig
+from lerobot.policies.pi05_imle_checkpoint.configuration_pi05_imle_checkpoint import PI05IMLECheckpointConfig
 from lerobot.policies.pi05_imle_unet.configuration_pi05_imle_unet import PI05IMLEUnetConfig
 from lerobot.policies.pi05_imle_lora.configuration_pi05_imle_lora import PI05IMLELoRAConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
@@ -104,6 +105,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from lerobot.policies.pi05_imle.modeling_pi05_imle import PI05IMLEPolicy as PI05IMLEPolicy
         
         return PI05IMLEPolicy
+    elif name == "pi05_imle_checkpoint":
+        from lerobot.policies.pi05_imle_checkpoint.modeling_pi05_imle_checkpoint import PI05IMLECheckpointPolicy as PI05IMLECheckpointPolicy
+        
+        return PI05IMLECheckpointPolicy
     elif name == "pi05_imle_lora":
         from lerobot.policies.pi05_imle_lora.modeling_pi05_imle_lora import PI05IMLELoRAPolicy as PI05IMLELoRAPolicy
 
@@ -141,7 +146,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
 
     Args:
         policy_type: The type of the policy. Supported types include "tdmpc",
-                     "diffusion", "act", "vqbet", "pi0", "pi05", "pi05_imle_lora", "sac",
+                     "diffusion", "act", "vqbet", "pi0", "pi05", "pi05_imle",
+                     "pi05_imle_lora", "sac",
                      "smolvla", "reward_classifier".
         **kwargs: Keyword arguments to be passed to the configuration class constructor.
 
@@ -167,6 +173,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return PI05Config(**kwargs)
     elif policy_type == "pi05_imle":
         return PI05IMLEConfig(**kwargs)
+    elif policy_type == "pi05_imle_checkpoint":
+        return PI05IMLECheckpointConfig(**kwargs)
     elif policy_type == "pi05_imle_lora":
         return PI05IMLELoRAConfig(**kwargs)
     elif policy_type == "pi05_imle_unet":
@@ -339,6 +347,14 @@ def make_pre_post_processors(
         from lerobot.policies.pi05_imle.processor_pi05_imle import make_pi05_imle_pre_post_processors
 
         processors = make_pi05_imle_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, PI05IMLECheckpointConfig):
+        from lerobot.policies.pi05_imle_checkpoint.processor_pi05_imle_checkpoint import make_pi05_imle_checkpoint_pre_post_processors
+
+        processors = make_pi05_imle_checkpoint_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )
