@@ -14,6 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import builtins
 import logging
 import math
@@ -28,7 +30,9 @@ from torch import Tensor, nn
 from lerobot.utils.import_utils import _transformers_available
 
 # LoRA related
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, PeftModel, get_peft_model
+from safetensors.torch import save_model as save_model_as_safetensor
+from huggingface_hub.constants import SAFETENSORS_SINGLE_FILE
 
 # Conditional import for type checking and lazy loading
 if TYPE_CHECKING or _transformers_available:
@@ -52,16 +56,36 @@ from lerobot.utils.constants import (
     OPENPI_ATTENTION_MASK_VALUE,
 )
 
+### IMLE Loss from IMLE Policy
+
+def rs_imle_loss(actions, sampled_actions, epsilon=0.03):
+    B, T, D = actions.shape
+    n_samples = sampled_actions.shape[1]
+
+    real_flat = actions.reshape(B, 1, -1)
+    fake_flat = sampled_actions.reshape(B, n_samples, -1)
+
+    distances = torch.cdist(real_flat, fake_flat).squeeze(1)
+
+    valid_samples = (distances > epsilon).float()
+    # wandb.log({"max_distance": distances.max().item(), "min_distance": distances.min().item(), "mean_distance": distances.mean().item(), "epsilon": epsilon})
+    min_distances, _ = (distances + (1 - valid_samples) * distances.max()).min(dim=1)
+    valid_real_samples = (min_distances < distances.max()).float()
+    if valid_real_samples.sum() > 0:
+        loss = (min_distances * valid_real_samples).sum() / valid_real_samples.sum()
+    else:
+        loss = torch.tensor(0.0, device=actions.device)
+
+    wandb_log = ({"max_distance": distances.max().item(), "min_distance": distances.min().item(), "mean_distance": distances.mean().item(), "epsilon": epsilon, "loss": loss.item()})
+    return loss, wandb_log
+
 ### LoRA utils
 
-def add_lora_to_gemma(policy: "PI05IMLELoRAPolicy") -> None:
+def add_lora_to_paligemma(policy: "PI05IMLELoRAPolicy") -> None:
     """
-        Wrapping Gemma model with LoRA. We only finetune the text Gemma model with LoRA
+        Wrapping PaliGemma model with LoRA. We only finetune the text Gemma model with LoRA
     """
     cfg = policy.config
-
-    if cfg.lora_target != "language":
-        raise NotImplementedError(f"Unsupported lora_target={cfg.lora_target}; only 'language' is handled.")
 
     paligemma = policy.model.paligemma_with_expert.paligemma
 
@@ -70,8 +94,7 @@ def add_lora_to_gemma(policy: "PI05IMLELoRAPolicy") -> None:
         p.requires_grad = False
     paligemma.vision_tower.eval()
 
-    # Finding LoRA modules in language model
-
+    # Finding LoRA modules in language model and MLP layers
     # Keep it consistent with the _fix_pytorch_state_dict_keys
     attn_proj = ["q_proj", "k_proj", "v_proj", "o_proj"]
     mlp_proj = ["gate_proj", "up_proj", "down_proj"]
@@ -81,7 +104,7 @@ def add_lora_to_gemma(policy: "PI05IMLELoRAPolicy") -> None:
         return [
             name
             for name, module in model.named_modules()
-            if name.endswith(proj) and "language_model" in name
+            if name.split(".")[-1] == proj and "language_model" in name
         ]
 
     target_modules = [leaf 
@@ -97,10 +120,9 @@ def add_lora_to_gemma(policy: "PI05IMLELoRAPolicy") -> None:
         task_type="CAUSAL_LM",
     )
 
-    paligemma = get_peft_model(paligemma, lora_cfg)
     paligemma.enable_input_require_grads()
+    paligemma = get_peft_model(paligemma, lora_cfg)
     policy.model.paligemma_with_expert.paligemma = paligemma
-
     print_lora_parameter_stats(paligemma)
 
 def print_lora_parameter_stats(model: nn.Module):
@@ -149,7 +171,6 @@ def get_safe_dtype(target_dtype, device_type):
         if target_dtype == torch.float64:
             return torch.float64
     return target_dtype
-
 
 def create_sinusoidal_pos_embedding(  # see openpi `create_sinusoidal_pos_embedding` (exact copy)
     time: torch.Tensor, dimension: int, min_period: float, max_period: float, device="cpu"
@@ -672,6 +693,13 @@ class PI05IMLELoRAPytorch(nn.Module):  # see openpi `PI0Pytorch`
         )
         time = time_beta * self.config.time_sampling_scale + self.config.time_sampling_offset
         return time.to(dtype=torch.float32, device=device)
+    
+    def sample_time_static(self, bsize, device):
+        """
+            Sample static time 
+        """
+        time = torch.zeros((bsize, ), dtype=torch.float32, device=device)
+        return time
 
     def embed_prefix(
         self, images, img_masks, tokens, masks
@@ -763,20 +791,28 @@ class PI05IMLELoRAPytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         return embs, pad_masks, att_masks, adarms_cond
 
-    def forward(self, images, img_masks, tokens, masks, actions, noise=None, time=None) -> Tensor:
+    def forward(self, images, img_masks, tokens, masks, actions) -> Tensor:
         """Do a full training forward pass and compute the loss."""
-        if noise is None:
-            noise = self.sample_noise(actions.shape, actions.device)
 
-        if time is None:
-            time = self.sample_time(actions.shape[0], actions.device)
+        B, T, D = actions.shape
+        S = self.config.imle_num_samples
+        device = actions.device
 
-        time_expanded = time[:, None, None]
-        x_t = time_expanded * noise + (1 - time_expanded) * actions
-        u_t = noise - actions
-
+        # Generating S action chunks. Context embedding and expansion to match dimension
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
+        prefix_embs = prefix_embs.repeat_interleave(S, dim=0)
+        prefix_pad_masks = prefix_pad_masks.repeat_interleave(S, dim=0)
+        prefix_att_masks = prefix_att_masks.repeat_interleave(S, dim=0)
+
+        # IMLE random samples 
+        noise_shape = (B, S, T, D)
+        noise = self.sample_noise(noise_shape, device)
+        noise_flat = noise.reshape(B*S, T, D)
+
+        # since we do one step conditional generation, return static time of 0.
+        time = self.sample_time_static(B*S, device)
+
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(noise_flat, time)
 
         if (
             self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
@@ -814,15 +850,15 @@ class PI05IMLELoRAPytorch(nn.Module):  # see openpi `PI0Pytorch`
         def action_out_proj_func(suffix_out):
             return self.action_out_proj(suffix_out)
 
-        v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
+        sampled_actions_flat = self._apply_checkpoint(action_out_proj_func, suffix_out)
+        sampled_actions = sampled_actions_flat.reshape(B, S, T, D)
 
-        return F.mse_loss(u_t, v_t, reduction="none")
+        loss, wandb_log = rs_imle_loss(actions, sampled_actions, epsilon=self.config.imle_epsilon)
+        return loss, wandb_log 
 
-    @torch.no_grad()  # see openpi `sample_actions` (slightly adapted)
-    def sample_actions(self, images, img_masks, tokens, masks, noise=None, num_steps=None) -> Tensor:
+    @torch.no_grad()  
+    def sample_actions(self, images, img_masks, tokens, masks, noise=None) -> Tensor:
         """Do a full inference forward and compute the action."""
-        if num_steps is None:
-            num_steps = self.config.num_inference_steps
 
         bsize = tokens.shape[0]
         device = tokens.device
@@ -843,6 +879,7 @@ class PI05IMLELoRAPytorch(nn.Module):  # see openpi `PI0Pytorch`
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
         self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
 
+        # Generating conditional embedded from prefix_embs (past_key_values)
         _, past_key_values = self.paligemma_with_expert.forward(
             attention_mask=prefix_att_2d_masks_4d,
             position_ids=prefix_position_ids,
@@ -851,33 +888,10 @@ class PI05IMLELoRAPytorch(nn.Module):  # see openpi `PI0Pytorch`
             use_cache=True,
         )
 
-        dt = -1.0 / num_steps
-        dt = torch.tensor(dt, dtype=torch.float32, device=device)
+        time = self.sample_time_static(bsize, device)
 
-        x_t = noise
-        time = torch.tensor(1.0, dtype=torch.float32, device=device)
-        while time >= -dt / 2:
-            expanded_time = time.expand(bsize)
-            v_t = self.denoise_step(
-                prefix_pad_masks,
-                past_key_values,
-                x_t,
-                expanded_time,
-            )
-            x_t = x_t + dt * v_t
-            time += dt
-
-        return x_t
-
-    def denoise_step(
-        self,
-        prefix_pad_masks,
-        past_key_values,
-        x_t,
-        timestep,
-    ):
-        """Apply one denoising step of the noise `x_t` at a given timestep."""
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, timestep)
+        # Generate action chunk based on condition (past_key_values)
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(noise, time)
 
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]
@@ -928,20 +942,6 @@ class PI05IMLELoRAPolicy(PreTrainedPolicy):
 
         # Initialize the core PI05 model
         self.model = PI05IMLELoRAPytorch(config)
-        self.lora_applied: bool = False
-
-        # Always wrap with LoRA so LoRA checkpoints load; toggle trainability via use_lora
-        if not self.lora_applied:
-            add_lora_to_gemma(self)
-            self.lora_applied = True
-
-        # If use_lora is True, only train LoRA adapters; freeze everything else.
-        if config.use_lora:
-            self._freeze_non_lora_parameters()
-
-        # If use_lora is False, disable adapters so the model matches the base checkpoint
-        if not config.use_lora:
-            self._freeze_lora_adapters()
 
         # Enable gradient checkpointing if requested
         if config.gradient_checkpointing:
@@ -974,8 +974,9 @@ class PI05IMLELoRAPolicy(PreTrainedPolicy):
                 frozen += param.numel()
         logging.info(f"LoRA-only finetuning: trainable={trainable:,} frozen={frozen:,}")
 
+    # construct model checkpoint with LoRA adapters
     @classmethod
-    def from_pretrained(
+    def from_pi05(
         cls: builtins.type[T],
         pretrained_name_or_path: str | Path,
         *,
@@ -990,11 +991,17 @@ class PI05IMLELoRAPolicy(PreTrainedPolicy):
         strict: bool = True,
         **kwargs,
     ) -> T:
-        """Override the from_pretrained method to handle key remapping and display important disclaimer."""
+        """
+            Build an IMLE compatible model from PI05 checkpoint.
+            We load the full pi05 checkpoint and add LoRA adapters
+        """
         print(
-            "The PI05 model is a direct port of the OpenPI implementation. \n"
-            "This implementation follows the original OpenPI structure for compatibility. \n"
-            "Original implementation: https://github.com/Physical-Intelligence/openpi"
+            """
+                This function creates a model where we only load the PaLIGemma2B
+                parameters and randomly initialize the Gemma Expert model.
+                This should create a skeleton model for training the Gemma
+                Expert only.
+            """ 
         )
         if pretrained_name_or_path is None:
             raise ValueError("pretrained_name_or_path is required")
@@ -1016,11 +1023,6 @@ class PI05IMLELoRAPolicy(PreTrainedPolicy):
         # Initialize model without loading weights
         # Check if dataset_stats were provided in kwargs
         model = cls(config, **kwargs)
-
-        # If we are loading a LoRA checkpoint, make sure adapters exist before loading weights.
-        if config.use_lora and not getattr(model, "lora_applied", False):
-            add_lora_to_gemma(model)
-            model.lora_applied = True
 
         # Now manually load and remap the state dict
         try:
@@ -1070,15 +1072,8 @@ class PI05IMLELoRAPolicy(PreTrainedPolicy):
             if remap_count > 0:
                 print(f"Remapped {remap_count} state dict keys")
 
-            # If checkpoint has no LoRA params but model expects them, relax strict loading
-            has_lora_in_ckpt = any("lora_" in k for k in remapped_state_dict)
-            load_strict = strict
-            if config.use_lora and not has_lora_in_ckpt:
-                print("No LoRA keys found in checkpoint; loading with strict=False and adapters")
-                load_strict = False
-
             # Load the remapped state dict into the model
-            missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=load_strict)
+            missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=False)
 
             if missing_keys:
                 print(f"Missing keys when loading state dict: {len(missing_keys)} keys")
@@ -1105,8 +1100,193 @@ class PI05IMLELoRAPolicy(PreTrainedPolicy):
 
         except Exception as e:
             print(f"Warning: Could not remap state dict keys: {e}")
+        
+        if config.use_lora:
+            add_lora_to_paligemma(model)
 
         return model
+
+
+    @classmethod
+    def from_pretrained(
+        cls: builtins.type[T],
+        pretrained_name_or_path: str | Path,
+        *,
+        config: PreTrainedConfig | None = None,
+        force_download: bool = False,
+        resume_download: bool | None = None,
+        proxies: dict | None = None,
+        token: str | bool | None = None,
+        cache_dir: str | Path | None = None,
+        local_files_only: bool = False,
+        revision: str | None = None,
+        strict: bool = True,
+        **kwargs,
+    ) -> T:
+        """Override the from_pretrained method to handle key remapping and display important disclaimer."""
+        print(
+            "The PI05 model is a direct port of the OpenPI implementation. \n"
+            "This implementation follows the original OpenPI structure for compatibility. \n"
+            "Original implementation: https://github.com/Physical-Intelligence/openpi"
+        )
+        if pretrained_name_or_path is None:
+            raise ValueError("pretrained_name_or_path is required")
+
+        # Use provided config if available, otherwise create default config
+        if config is None:
+            config = PreTrainedConfig.from_pretrained(
+                pretrained_name_or_path=pretrained_name_or_path,
+                force_download=force_download,
+                resume_download=resume_download,
+                proxies=proxies,
+                token=token,
+                cache_dir=cache_dir,
+                local_files_only=local_files_only,
+                revision=revision,
+                **kwargs,
+            )
+
+        # Initialize model without loading weights
+        # Check if dataset_stats were provided in kwargs
+        model = cls(config, **kwargs)
+
+        # Now manually load and remap the state dict
+        try:
+            # Try to load the pytorch_model.bin or model.safetensors file
+            print(f"Loading model from: {pretrained_name_or_path}")
+            try:
+                from transformers.utils import cached_file
+
+                # Try safetensors first
+                resolved_file = cached_file(
+                    pretrained_name_or_path,
+                    "model.safetensors",
+                    cache_dir=kwargs.get("cache_dir"),
+                    force_download=kwargs.get("force_download", False),
+                    resume_download=kwargs.get("resume_download"),
+                    proxies=kwargs.get("proxies"),
+                    use_auth_token=kwargs.get("use_auth_token"),
+                    revision=kwargs.get("revision"),
+                    local_files_only=kwargs.get("local_files_only", False),
+                )
+                from safetensors.torch import load_file
+
+                original_state_dict = load_file(resolved_file)
+                print("✓ Loaded state dict from model.safetensors")
+            except Exception as e:
+                print(f"Could not load state dict from remote files: {e}")
+                print("Returning model without loading pretrained weights")
+                return model
+
+            # First, fix any key differences # see openpi `model.py, _fix_pytorch_state_dict_keys`
+            fixed_state_dict = model._fix_pytorch_state_dict_keys(original_state_dict, model.config)
+
+            # Then add "model." prefix for all keys that don't already have it
+            remapped_state_dict = {}
+            remap_count = 0
+
+            for key, value in fixed_state_dict.items():
+                if not key.startswith("model."):
+                    new_key = f"model.{key}"
+                    remapped_state_dict[new_key] = value
+                    remap_count += 1
+                    if remap_count <= 10:  # Only print first 10 to avoid spam
+                        print(f"Remapped: {key} -> {new_key}")
+                else:
+                    remapped_state_dict[key] = value
+
+            if remap_count > 0:
+                print(f"Remapped {remap_count} state dict keys")
+
+            # Load the remapped state dict into the model
+            missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=True)
+
+            if missing_keys:
+                print(f"Missing keys when loading state dict: {len(missing_keys)} keys")
+                if len(missing_keys) <= 5:
+                    for key in missing_keys:
+                        print(f"  - {key}")
+                else:
+                    for key in missing_keys[:5]:
+                        print(f"  - {key}")
+                    print(f"  ... and {len(missing_keys) - 5} more")
+
+            if unexpected_keys:
+                print(f"Unexpected keys when loading state dict: {len(unexpected_keys)} keys")
+                if len(unexpected_keys) <= 5:
+                    for key in unexpected_keys:
+                        print(f"  - {key}")
+                else:
+                    for key in unexpected_keys[:5]:
+                        print(f"  - {key}")
+                    print(f"  ... and {len(unexpected_keys) - 5} more")
+
+            if not missing_keys and not unexpected_keys:
+                print("All keys loaded successfully!")
+
+        except Exception as e:
+            print(f"Warning: Could not remap state dict keys: {e}")
+        
+        # Load LoRA params if use_lora
+        if config.use_lora:
+            try:
+                lora_path = None
+                if Path(pretrained_name_or_path).is_dir():
+                    candidate = Path(pretrained_name_or_path) / "lora"
+                    if candidate.exists():
+                        lora_path = candidate
+                if lora_path is None:
+                    lora_path = pretrained_name_or_path
+
+                paligemma = model.paligemma_with_expert.paligemma
+                paligemma = PeftModel.from_pretrained(
+                    paligemma,
+                    lora_path,
+                    subfolder=None if Path(lora_path).is_dir() else "lora",
+                    is_trainable=False,
+                    cache_dir=kwargs.get("cache_dir"),
+                    force_download=kwargs.get("force_download", False),
+                    resume_download=kwargs.get("resume_download"),
+                    proxies=kwargs.get("proxies"),
+                    token=kwargs.get("use_auth_token"),
+                    revision=kwargs.get("revision"),
+                    local_files_only=kwargs.get("local_files_only", False),
+                )
+                model.paligemma_with_expert.paligemma = paligemma
+                print("✓ Loaded LoRA adapters")
+            except Exception as e:
+                print(f"Warning: Failed to load LoRA adapters: {e}")
+        return model
+    
+    def _save_pretrained(self, save_directory: Path) -> None:
+        """
+            If using LoRA, create LoRA folder and save the LoRA params
+        """
+        self.config._save_pretrained(save_directory)
+        model_to_save = self.module if hasattr(self, "module") else self
+
+        if self.config.use_lora:
+            # We only apply peft to paligemma model
+            peft_model = self.model.paligemma_with_expert.paligemma
+            lora_directory = save_directory / "lora"
+            print("Saving LoRA adapters to: {}".format(lora_directory))
+            peft_model.save_pretrained(lora_directory)
+
+            # Temporarily Unwrap the model and put it back later 
+            pali_ref = model_to_save.model.paligemma_with_expert.paligemma 
+            base_pali = pali_ref.get_base_model()
+            model_to_save.model.paligemma_with_expert.paligemma = base_pali
+        
+            try: 
+                save_model_as_safetensor(
+                    model_to_save, str(save_directory / SAFETENSORS_SINGLE_FILE)
+                )
+            finally:
+                model_to_save.model.paligemma_with_expert.paligemma = pali_ref
+        else: 
+            save_model_as_safetensor(
+                model_to_save, str(save_directory / SAFETENSORS_SINGLE_FILE)
+            )
 
     def _fix_pytorch_state_dict_keys(
         self, state_dict, model_config
@@ -1115,9 +1295,6 @@ class PI05IMLELoRAPolicy(PreTrainedPolicy):
         import re
 
         fixed_state_dict = {}
-
-        paligemma_prefix_flat = "model.paligemma_with_expert.paligemma.model."
-        paligemma_prefix_nested = "model.paligemma_with_expert.paligemma.base_model.model.model."
 
         for key, value in state_dict.items():
             new_key = key
@@ -1151,53 +1328,13 @@ class PI05IMLELoRAPolicy(PreTrainedPolicy):
                 logging.warning(f"Skipping state_proj key in pi05 mode: {key}")
                 continue
 
-            # Remap legacy paligemma keys from flat to nested
-            if new_key.startswith(paligemma_prefix_flat):
-                new_key = new_key.replace(paligemma_prefix_flat, paligemma_prefix_nested)
-            elif new_key.startswith(paligemma_prefix_flat.removeprefix("model.")):
-                new_key = new_key.replace(
-                    paligemma_prefix_flat.removeprefix("model."),
-                    paligemma_prefix_nested.removeprefix("model."),
-                )
-
-            # If LoRA is enabled and checkpoint is non-LoRA, map flat proj weights to base_layer (language only)
-            if getattr(self.config, "use_lora", False) and "language_model" in new_key:
-                # Attention projections
-                for proj in ["q_proj", "k_proj", "v_proj", "o_proj"]:
-                    suffix = f".self_attn.{proj}.weight"
-                    if new_key.endswith(suffix) and "base_layer" not in new_key:
-                        new_key = new_key.replace(suffix, f".self_attn.{proj}.base_layer.weight")
-                        break
-                # MLP projections
-                for proj in ["gate_proj", "up_proj", "down_proj"]:
-                    suffix = f".mlp.{proj}.weight"
-                    if new_key.endswith(suffix) and "base_layer" not in new_key:
-                        new_key = new_key.replace(suffix, f".mlp.{proj}.base_layer.weight")
-                        break
-                # Map lm_head to embeddings for non-LoRA checkpoints (PEFT ties head to embed tokens)
-                if new_key.endswith("paligemma_with_expert.paligemma.lm_head.weight"):
-                    new_key = new_key.replace(
-                        "paligemma_with_expert.paligemma.lm_head.weight",
-                        "paligemma_with_expert.paligemma.base_model.model.model.language_model.embed_tokens.base_layer.weight",
-                    )
-
             # Handle vision tower embedding layer potential differences
             if "patch_embedding" in key:
                 logging.warning(f"Vision embedding key might need handling: {key}")
 
             fixed_state_dict[new_key] = value
 
-        # # Fallback: some checkpoints omit the tied embed_tokens weight; reuse lm_head weight instead.
-        # embed_key = (
-        #     "model.paligemma_with_expert.paligemma.base_model.model.model.language_model.embed_tokens.weight"
-        # )
-        # lm_head_key = "model.paligemma_with_expert.paligemma.base_model.model.lm_head.weight"
-        # if embed_key not in fixed_state_dict and lm_head_key in fixed_state_dict:
-        #     logging.warning(f"Tying missing embed_tokens weight from lm_head weight: {lm_head_key} -> {embed_key}")
-        #     fixed_state_dict[embed_key] = fixed_state_dict[lm_head_key]
-
         return fixed_state_dict
-
 
     def get_optim_params(self) -> dict:
         return self.parameters()
@@ -1321,17 +1458,10 @@ class PI05IMLELoRAPolicy(PreTrainedPolicy):
         actions = self.prepare_action(batch)
 
         # Compute loss (no separate state needed for PI05)
-        losses = self.model.forward(images, img_masks, tokens, masks, actions)
+        losses, wandb_log = self.model.forward(images, img_masks, tokens, masks, actions)
 
         # Truncate losses to actual action dimensions
-        original_action_dim = self.config.output_features[ACTION].shape[0]
-        losses = losses[:, :, :original_action_dim]
 
         loss = losses.mean()
-        loss_per_dim = losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist()
-        loss_dict = {
-            "loss": loss.item(),
-             **{f"loss_per_dim/{i}": v for i, v in enumerate(loss_per_dim)},
-        }
 
-        return loss, loss_dict
+        return loss, wandb_log
