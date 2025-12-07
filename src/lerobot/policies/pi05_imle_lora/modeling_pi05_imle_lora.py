@@ -83,27 +83,22 @@ def rs_imle_loss(actions, sampled_actions, epsilon=0.03):
 
 def add_lora_to_paligemma(policy: "PI05IMLELoRAPolicy") -> None:
     """
-        Wrapping PaliGemma model with LoRA. We only finetune the text Gemma model with LoRA
+        Wrapping model with LoRA. We only finetune the language model  
+        with LoRA
     """
     cfg = policy.config
-
-    paligemma = policy.model.paligemma_with_expert.paligemma
-
-    # Freeze vision tower; we only finetune the language stack.
-    for p in paligemma.vision_tower.parameters():
-        p.requires_grad = False
-    paligemma.vision_tower.eval()
 
     # Finding LoRA modules in language model and MLP layers
     # Keep it consistent with the _fix_pytorch_state_dict_keys
     attn_proj = ["q_proj", "k_proj", "v_proj", "o_proj"]
     mlp_proj = ["gate_proj", "up_proj", "down_proj"]
     proj_names = attn_proj + mlp_proj
+    paligemma = policy.model.paligemma_with_expert.paligemma
 
     def find_llm_modules(model, proj):
         return [
             name
-            for name, module in model.named_modules()
+            for name, _ in model.named_modules()
             if name.split(".")[-1] == proj and "language_model" in name
         ]
 
@@ -119,11 +114,9 @@ def add_lora_to_paligemma(policy: "PI05IMLELoRAPolicy") -> None:
         target_modules=target_modules,
         task_type="CAUSAL_LM",
     )
-
-    paligemma.enable_input_require_grads()
-    paligemma = get_peft_model(paligemma, lora_cfg)
-    policy.model.paligemma_with_expert.paligemma = paligemma
-    print_lora_parameter_stats(paligemma)
+    policy.model.paligemma_with_expert.paligemma = get_peft_model(paligemma, lora_cfg)
+    policy.model.paligemma_with_expert.paligemma.enable_input_require_grads()
+    print_lora_parameter_stats(policy.model)
 
 def print_lora_parameter_stats(model: nn.Module):
     """
@@ -149,14 +142,6 @@ def print_lora_parameter_stats(model: nn.Module):
     print(f"Percentage trainable:        {pct:.6f}%")
     print("===============================================================\n")
 
-def freeze_paligemma(paligemma: nn.Module):
-    """
-        Freeze PaliGemma if we don't use LoRA finetuning.
-        In this case we only train the IMLE model
-    """
-    for p in paligemma.parameters():
-        p.requires_grad = False
-    paligemma.eval()
 
 ### PiO5 Model
 
@@ -951,28 +936,16 @@ class PI05IMLELoRAPolicy(PreTrainedPolicy):
 
         self.reset()
 
-    def _freeze_lora_adapters(self) -> None:
-        """Disable LoRA adapters and freeze the entire model when LoRA is off."""
-        for _, param in self.model.named_parameters():
-            param.requires_grad = False
-        # At runtime, also disable adapter layers to fully bypass LoRA in forward
-        paligemma = getattr(self.model.paligemma_with_expert, "paligemma", None)
-        if paligemma is not None and hasattr(paligemma, "disable_adapter_layers"):
-            paligemma.disable_adapter_layers()
-        logging.info("Disabled LoRA adapters and froze all parameters")
-
-    def _freeze_non_lora_parameters(self) -> None:
-        """Freeze everything except LoRA adapter parameters."""
-        frozen = 0
-        trainable = 0
-        for name, param in self.model.named_parameters():
-            if "lora_" in name:
-                param.requires_grad = True
-                trainable += param.numel()
-            else:
-                param.requires_grad = False
-                frozen += param.numel()
-        logging.info(f"LoRA-only finetuning: trainable={trainable:,} frozen={frozen:,}")
+    def _freeze_paligemma(self) -> None:
+        """
+            Freeze PaliGemma if we don't use LoRA finetuning.
+            In this case we only train the IMLE model
+        """
+        print("Freezeing PaliGemma parameters.")
+        paligemma = self.model.paligemma_with_expert.paligemma
+        for p in paligemma.parameters():
+            p.requires_grad = False
+        paligemma.eval()
 
     # construct model checkpoint with LoRA adapters
     @classmethod
@@ -997,10 +970,11 @@ class PI05IMLELoRAPolicy(PreTrainedPolicy):
         """
         print(
             """
-                This function creates a model where we only load the PaLIGemma2B
-                parameters and randomly initialize the Gemma Expert model.
+                This function creates a model where we load a pretrained PaliGemma with
+                Action Expert model.
                 This should create a skeleton model for training the Gemma
                 Expert only.
+                Additionally, add LoRA adapters to the model if needed.
             """ 
         )
         if pretrained_name_or_path is None:
@@ -1022,7 +996,7 @@ class PI05IMLELoRAPolicy(PreTrainedPolicy):
 
         # Initialize model without loading weights
         # Check if dataset_stats were provided in kwargs
-        model = cls(config, **kwargs)
+        policy = cls(config, **kwargs)
 
         # Now manually load and remap the state dict
         try:
@@ -1050,10 +1024,10 @@ class PI05IMLELoRAPolicy(PreTrainedPolicy):
             except Exception as e:
                 print(f"Could not load state dict from remote files: {e}")
                 print("Returning model without loading pretrained weights")
-                return model
+                return policy
 
             # First, fix any key differences # see openpi `model.py, _fix_pytorch_state_dict_keys`
-            fixed_state_dict = model._fix_pytorch_state_dict_keys(original_state_dict, model.config)
+            fixed_state_dict = policy._fix_pytorch_state_dict_keys(original_state_dict, policy.config)
 
             # Then add "model." prefix for all keys that don't already have it
             remapped_state_dict = {}
@@ -1072,9 +1046,11 @@ class PI05IMLELoRAPolicy(PreTrainedPolicy):
             if remap_count > 0:
                 print(f"Remapped {remap_count} state dict keys")
 
-            # Load the remapped state dict into the model
-            missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=False)
 
+            # Load the remapped state dict into the model
+            missing_keys, unexpected_keys = policy.load_state_dict(remapped_state_dict, strict=False)
+
+            print("model loaded!")
             if missing_keys:
                 print(f"Missing keys when loading state dict: {len(missing_keys)} keys")
                 if len(missing_keys) <= 5:
@@ -1102,9 +1078,28 @@ class PI05IMLELoRAPolicy(PreTrainedPolicy):
             print(f"Warning: Could not remap state dict keys: {e}")
         
         if config.use_lora:
-            add_lora_to_paligemma(model)
+            add_lora_to_paligemma(policy)
+        return policy
 
-        return model
+    @staticmethod
+    def _report_state_dict_load(prefix: str, missing, unexpected):
+        if missing:
+            print(f"[{prefix}] Missing keys ({len(missing)}):")
+            for k in missing[:20]:
+                print("  -", k)
+            if len(missing) > 20:
+                print(f"  ... and {len(missing)-20} more")
+        else:
+            print(f"[{prefix}] No missing keys.")
+
+        if unexpected:
+            print(f"[{prefix}] Unexpected keys ({len(unexpected)}):")
+            for k in unexpected[:20]:
+                print("  -", k)
+            if len(unexpected) > 20:
+                print(f"  ... and {len(unexpected)-20} more")
+        else:
+            print(f"[{prefix}] No unexpected keys.")
 
 
     @classmethod
@@ -1127,6 +1122,7 @@ class PI05IMLELoRAPolicy(PreTrainedPolicy):
         print(
             "The PI05 model is a direct port of the OpenPI implementation. \n"
             "This implementation follows the original OpenPI structure for compatibility. \n"
+            "Additionally, this version adds LoRA adapters around the PaliGemma2B Language Model if config.use_lora=True\n"
             "Original implementation: https://github.com/Physical-Intelligence/openpi"
         )
         if pretrained_name_or_path is None:
@@ -1148,145 +1144,82 @@ class PI05IMLELoRAPolicy(PreTrainedPolicy):
 
         # Initialize model without loading weights
         # Check if dataset_stats were provided in kwargs
-        model = cls(config, **kwargs)
+        policy = cls(config, **kwargs)
 
         # Now manually load and remap the state dict
-        try:
-            # Try to load the pytorch_model.bin or model.safetensors file
-            print(f"Loading model from: {pretrained_name_or_path}")
-            try:
-                from transformers.utils import cached_file
+        # Try to load the pytorch_model.bin or model.safetensors file
+        print(f"Loading model from: {pretrained_name_or_path}")
+        # Load Paligemma 2B 
+        from transformers.utils import cached_file
 
-                # Try safetensors first
-                resolved_file = cached_file(
-                    pretrained_name_or_path,
-                    "model.safetensors",
-                    cache_dir=kwargs.get("cache_dir"),
-                    force_download=kwargs.get("force_download", False),
-                    resume_download=kwargs.get("resume_download"),
-                    proxies=kwargs.get("proxies"),
-                    use_auth_token=kwargs.get("use_auth_token"),
-                    revision=kwargs.get("revision"),
-                    local_files_only=kwargs.get("local_files_only", False),
-                )
-                from safetensors.torch import load_file
-
-                original_state_dict = load_file(resolved_file)
-                print("✓ Loaded state dict from model.safetensors")
-            except Exception as e:
-                print(f"Could not load state dict from remote files: {e}")
-                print("Returning model without loading pretrained weights")
-                return model
-
-            # First, fix any key differences # see openpi `model.py, _fix_pytorch_state_dict_keys`
-            fixed_state_dict = model._fix_pytorch_state_dict_keys(original_state_dict, model.config)
-
-            # Then add "model." prefix for all keys that don't already have it
-            remapped_state_dict = {}
-            remap_count = 0
-
-            for key, value in fixed_state_dict.items():
-                if not key.startswith("model."):
-                    new_key = f"model.{key}"
-                    remapped_state_dict[new_key] = value
-                    remap_count += 1
-                    if remap_count <= 10:  # Only print first 10 to avoid spam
-                        print(f"Remapped: {key} -> {new_key}")
-                else:
-                    remapped_state_dict[key] = value
-
-            if remap_count > 0:
-                print(f"Remapped {remap_count} state dict keys")
-
-            # Load the remapped state dict into the model
-            missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=True)
-
-            if missing_keys:
-                print(f"Missing keys when loading state dict: {len(missing_keys)} keys")
-                if len(missing_keys) <= 5:
-                    for key in missing_keys:
-                        print(f"  - {key}")
-                else:
-                    for key in missing_keys[:5]:
-                        print(f"  - {key}")
-                    print(f"  ... and {len(missing_keys) - 5} more")
-
-            if unexpected_keys:
-                print(f"Unexpected keys when loading state dict: {len(unexpected_keys)} keys")
-                if len(unexpected_keys) <= 5:
-                    for key in unexpected_keys:
-                        print(f"  - {key}")
-                else:
-                    for key in unexpected_keys[:5]:
-                        print(f"  - {key}")
-                    print(f"  ... and {len(unexpected_keys) - 5} more")
-
-            if not missing_keys and not unexpected_keys:
-                print("All keys loaded successfully!")
-
-        except Exception as e:
-            print(f"Warning: Could not remap state dict keys: {e}")
-        
-        # Load LoRA params if use_lora
         if config.use_lora:
-            try:
-                lora_path = None
-                if Path(pretrained_name_or_path).is_dir():
-                    candidate = Path(pretrained_name_or_path) / "lora"
-                    if candidate.exists():
-                        lora_path = candidate
-                if lora_path is None:
-                    lora_path = pretrained_name_or_path
+            add_lora_to_paligemma(policy)
+        # Try safetensors first
+        resolved_file = cached_file(
+            pretrained_name_or_path,
+            "paligemma.safetensors",
+            cache_dir=kwargs.get("cache_dir"),
+            force_download=kwargs.get("force_download", False),
+            resume_download=kwargs.get("resume_download"),
+            proxies=kwargs.get("proxies"),
+            use_auth_token=kwargs.get("use_auth_token"),
+            revision=kwargs.get("revision"),
+            local_files_only=kwargs.get("local_files_only", False),
+        )
+        from safetensors.torch import load_file
 
-                paligemma = model.paligemma_with_expert.paligemma
-                paligemma = PeftModel.from_pretrained(
-                    paligemma,
-                    lora_path,
-                    subfolder=None if Path(lora_path).is_dir() else "lora",
-                    is_trainable=False,
-                    cache_dir=kwargs.get("cache_dir"),
-                    force_download=kwargs.get("force_download", False),
-                    resume_download=kwargs.get("resume_download"),
-                    proxies=kwargs.get("proxies"),
-                    token=kwargs.get("use_auth_token"),
-                    revision=kwargs.get("revision"),
-                    local_files_only=kwargs.get("local_files_only", False),
-                )
-                model.paligemma_with_expert.paligemma = paligemma
-                print("✓ Loaded LoRA adapters")
-            except Exception as e:
-                print(f"Warning: Failed to load LoRA adapters: {e}")
-        return model
+        original_state_dict = load_file(resolved_file)
+        print("✓ Loaded state dict from paligemma.safetensors")
+        base_model = policy.model.paligemma_with_expert.paligemma.get_base_model()
+        missing_keys, unexpected_keys = base_model.load_state_dict(original_state_dict, strict=False)
+        cls._report_state_dict_load("Paligemma", missing_keys, unexpected_keys)
+
+
+        # Load Gemma Expert 
+        resolved_file = cached_file(
+            pretrained_name_or_path,
+            "action_expert.safetensors",
+            cache_dir=kwargs.get("cache_dir"),
+            force_download=kwargs.get("force_download", False),
+            resume_download=kwargs.get("resume_download"),
+            proxies=kwargs.get("proxies"),
+            use_auth_token=kwargs.get("use_auth_token"),
+            revision=kwargs.get("revision"),
+            local_files_only=kwargs.get("local_files_only", False),
+        )
+
+        original_state_dict = load_file(resolved_file)
+        print("✓ Loaded state dict from action_expert.safetensors")
+
+        missing_keys, unexpected_keys = policy.model.paligemma_with_expert.gemma_expert.model.load_state_dict(original_state_dict, strict=True)
+        cls._report_state_dict_load("Action Expert", missing_keys, unexpected_keys)
+
+
+        # Freeze paligemma. Only LoRA finetuning or train action expert only
+        policy._freeze_paligemma()
+        return policy
     
     def _save_pretrained(self, save_directory: Path) -> None:
         """
+            Save PaliGemma2B, Gemma expert separately.
             If using LoRA, create LoRA folder and save the LoRA params
         """
         self.config._save_pretrained(save_directory)
-        model_to_save = self.module if hasattr(self, "module") else self
+        # model_to_save = self.module if hasattr(self, "module") else self
+        model_to_save = self
+        paligemma = model_to_save.model.paligemma_with_expert.paligemma
+        if self.config.use_lora:
+            paligemma = paligemma.get_base_model()
+        action_expert = model_to_save.model.paligemma_with_expert.gemma_expert
+        save_model_as_safetensor(paligemma, str(save_directory / "paligemma.safetensors"))
+        save_model_as_safetensor(action_expert, str(save_directory / "action_expert.safetensors"))
 
         if self.config.use_lora:
-            # We only apply peft to paligemma model
-            peft_model = self.model.paligemma_with_expert.paligemma
+            # Save LoRA params and config under "lora"
             lora_directory = save_directory / "lora"
             print("Saving LoRA adapters to: {}".format(lora_directory))
-            peft_model.save_pretrained(lora_directory)
-
-            # Temporarily Unwrap the model and put it back later 
-            pali_ref = model_to_save.model.paligemma_with_expert.paligemma 
-            base_pali = pali_ref.get_base_model()
-            model_to_save.model.paligemma_with_expert.paligemma = base_pali
-        
-            try: 
-                save_model_as_safetensor(
-                    model_to_save, str(save_directory / SAFETENSORS_SINGLE_FILE)
-                )
-            finally:
-                model_to_save.model.paligemma_with_expert.paligemma = pali_ref
-        else: 
-            save_model_as_safetensor(
-                model_to_save, str(save_directory / SAFETENSORS_SINGLE_FILE)
-            )
+            lora_model = model_to_save.model.paligemma_with_expert.paligemma
+            lora_model.save_pretrained(lora_directory)
 
     def _fix_pytorch_state_dict_keys(
         self, state_dict, model_config

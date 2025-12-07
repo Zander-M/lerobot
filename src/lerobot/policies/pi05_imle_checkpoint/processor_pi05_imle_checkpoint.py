@@ -26,8 +26,8 @@ import numpy as np
 import torch
 
 from lerobot.configs.types import PipelineFeatureType, PolicyFeature
-from lerobot.policies.pi05_imle.configuration_pi05_imle import PI05IMLEConfig
-from lerobot.policies.pi05_imle.modeling_pi05_imle import pad_vector
+from lerobot.policies.pi05_imle_checkpoint.configuration_pi05_imle_checkpoint import PI05IMLECheckpointConfig
+from lerobot.policies.pi05_imle_checkpoint.modeling_pi05_imle_checkpoint import pad_vector
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
     DeviceProcessorStep,
@@ -102,7 +102,7 @@ class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
 
 
 def make_pi05_imle_checkpoint_pre_post_processors(
-    config: PI05IMLEConfig,
+    config: PI05IMLECheckpointConfig,
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
 ) -> tuple[
     PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],

@@ -88,11 +88,14 @@ class PI05IMLELoRAConfig(PreTrainedConfig):
     tokenizer_max_length: int = 200  # see openpi `__post_init__`
 
     # LoRA related configs
-    use_lora: bool = False
+    use_lora: bool = True
     lora_r: int = 16
     lora_alpha: int = 32
     lora_dropout: float = 0.05
-    lora_target: str = "language" # use LoRA finetuning for language model only
+
+    # IMLE Setting
+    imle_epsilon: float = 0.03 # IMLE epsilon
+    imle_num_samples : int = 8 # number of imle samples
 
     def __post_init__(self):
         super().__post_init__()

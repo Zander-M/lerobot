@@ -34,9 +34,8 @@ def build_checkpoint(pretrained_path: str, output_path: str, lora_config_path: s
         config.pretrained_path = None   # keepskeleton self-contained
         config.device = "cuda"
 
-    policy = PI05IMLELoRAPolicy.from_pretrained(pretrained_ckpt, 
-                                                config=config, 
-                                                strict=not config.use_lora)
+    policy = PI05IMLELoRAPolicy.from_pi05(pretrained_ckpt, 
+                                                config=config)
     policy.save_pretrained(output_dir)
     print(f"LoRA-ready checkpoint saved to {output_path}")
 

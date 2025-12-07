@@ -370,7 +370,7 @@ def make_pre_post_processors(
     elif isinstance(policy_cfg, PI05IMLELoRAConfig):
         from lerobot.policies.pi05_imle_lora.processor_pi05_imle_lora import make_pi05_imle_lora_pre_post_processors
 
-        processors = make_pi05_pre_post_processors(
+        processors = make_pi05_imle_lora_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )
