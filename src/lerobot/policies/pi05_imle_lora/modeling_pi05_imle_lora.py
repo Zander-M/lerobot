@@ -943,8 +943,11 @@ class PI05IMLELoRAPolicy(PreTrainedPolicy):
         """
         print("Freezeing PaliGemma parameters.")
         paligemma = self.model.paligemma_with_expert.paligemma
-        for p in paligemma.parameters():
-            p.requires_grad = False
+        for name, p in paligemma.named_parameters():
+            if "lora" in name:
+                p.requires_grad = True
+            else:
+                p.requires_grad = False
         paligemma.eval()
 
     # construct model checkpoint with LoRA adapters
@@ -1193,7 +1196,6 @@ class PI05IMLELoRAPolicy(PreTrainedPolicy):
 
         missing_keys, unexpected_keys = policy.model.paligemma_with_expert.gemma_expert.model.load_state_dict(original_state_dict, strict=True)
         cls._report_state_dict_load("Action Expert", missing_keys, unexpected_keys)
-
 
         # Freeze paligemma. Only LoRA finetuning or train action expert only
         policy._freeze_paligemma()
