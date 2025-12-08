@@ -1,14 +1,24 @@
+#!/usr/bin/env bash 
+set -euo pipefail 
+
+# Training Script
+
+# Move to correct directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(dirname "$SCRIPT_DIR")"
+cd "$ROOT_DIR"
+
 # San check evaluation script. Just to make sure the finetuned pi05 model works
 # GPU Config
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=7
 
 # suppress tokenizer parallelism
 export TOKENIZERS_PARALLELISM=false
 
 # Experiment Configs
 
-export POLICY_PATH=/localhome/zma40/Desktop/project/generative_models_course_project/models/pi05_imle_libero_fintuned
-export EVAL_TASK=libero_spatial
+export POLICY_PATH=/localhome/zma40/Desktop/project/generative_models_course_project/lerobot/outputs/train/2025-11-28/12-29-13_pi05_imle_finetuning/checkpoints/last/pretrained_model
+export EVAL_TASK=libero_object,libero_10,libero_spatial,libero_goal
 
 # Launch eval
 # policy.compile_model set to false due to limited shared memory

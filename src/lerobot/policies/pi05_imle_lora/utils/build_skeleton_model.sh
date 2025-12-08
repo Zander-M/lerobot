@@ -2,8 +2,8 @@
 # Build Pi05 IMLE LoRA checkpoint from pretrained checkpoint
 set -euo pipefail
 
-export PRETRAINED_PATH=/localhome/zma40/Desktop/project/generative_models_course_project/models/pi05_libero
-export OUTPUT_PATH=/localhome/zma40/Desktop/project/generative_models_course_project/models/pi05_imle_lora_libero_finetuned 
+export PRETRAINED_PATH=/localhome/zma40/Desktop/project/generative_models_course_project/lerobot/outputs/train/2025-12-03/08-54-53_pi05_imle_checkpoint_finetuning/checkpoints/last/pretrained_model
+export OUTPUT_PATH=/localhome/zma40/Desktop/project/generative_models_course_project/models/pi05_imle_lora_checkpoint_libero_finetuned 
 
 conda run -n lerobot python build_skeleton_model.py \
 --pretrained_path $PRETRAINED_PATH \
