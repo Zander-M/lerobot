@@ -24,11 +24,12 @@ from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from lerobot.optim.optimizers import AdamWConfig
 from lerobot.optim.schedulers import CosineDecayWithWarmupSchedulerConfig
+from lerobot.policies.pi05 import PI05Config
 
 
 @PreTrainedConfig.register_subclass("pi05_imle_lora")
 @dataclass
-class PI05IMLELoRAConfig(PreTrainedConfig):
+class PI05IMLELoRAConfig(PI05Config):
     paligemma_variant: str = "gemma_2b"
     action_expert_variant: str = "gemma_300m" # TODO switch to IMLE
     dtype: str = "float32"  # Options: "bfloat16", "float32"

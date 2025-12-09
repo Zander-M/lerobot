@@ -1194,11 +1194,51 @@ class PI05IMLELoRAPolicy(PreTrainedPolicy):
         original_state_dict = load_file(resolved_file)
         print("✓ Loaded state dict from action_expert.safetensors")
 
-        missing_keys, unexpected_keys = policy.model.paligemma_with_expert.gemma_expert.model.load_state_dict(original_state_dict, strict=True)
+        # Add "model." prefix if param does not have it.
+        remapped_state_dict = {}
+        remap_count = 0
+
+        for key, value in original_state_dict.items():
+            if not key.startswith("model."):
+                new_key = f"model.{key}"
+                remapped_state_dict[new_key] = value
+                remap_count += 1
+                if remap_count <= 10:  # Only print first 10 to avoid spam
+                    print(f"Remapped: {key} -> {new_key}")
+            else:
+                    remapped_state_dict[key] = value
+        missing_keys, unexpected_keys = policy.model.paligemma_with_expert.gemma_expert.load_state_dict(original_state_dict, strict=True)
         cls._report_state_dict_load("Action Expert", missing_keys, unexpected_keys)
 
         # Freeze paligemma. Only LoRA finetuning or train action expert only
         policy._freeze_paligemma()
+
+        # Load action projection and time MLP weights if present
+        try:
+            heads_file = cached_file(
+                pretrained_name_or_path,
+                "pi05_heads.safetensors",
+                cache_dir=kwargs.get("cache_dir"),
+                force_download=kwargs.get("force_download", False),
+                resume_download=kwargs.get("resume_download"),
+                proxies=kwargs.get("proxies"),
+                use_auth_token=kwargs.get("use_auth_token"),
+                revision=kwargs.get("revision"),
+                local_files_only=kwargs.get("local_files_only", False),
+            )
+            heads_state = load_file(heads_file)
+            for prefix, module in {
+                "action_in_proj": policy.model.action_in_proj,
+                "action_out_proj": policy.model.action_out_proj,
+                "time_mlp_in": policy.model.time_mlp_in,
+                "time_mlp_out": policy.model.time_mlp_out,
+            }.items():
+                sub_state = {k.split(".", 1)[1]: v for k, v in heads_state.items() if k.startswith(f"{prefix}.")}
+                if sub_state:
+                    missing, unexpected = module.load_state_dict(sub_state, strict=False)
+                    cls._report_state_dict_load("Action/Time heads", missing, unexpected)
+        except Exception as e:  # noqa: BLE001
+            print(f"Warning: could not load pi05_heads.safetensors: {e}")
         return policy
     
     def _save_pretrained(self, save_directory: Path) -> None:
@@ -1215,6 +1255,14 @@ class PI05IMLELoRAPolicy(PreTrainedPolicy):
         action_expert = model_to_save.model.paligemma_with_expert.gemma_expert
         save_model_as_safetensor(paligemma, str(save_directory / "paligemma.safetensors"))
         save_model_as_safetensor(action_expert, str(save_directory / "action_expert.safetensors"))
+
+        # Save action projections and time MLP
+        heads = nn.Module()
+        heads.action_in_proj = model_to_save.model.action_in_proj
+        heads.action_out_proj = model_to_save.model.action_out_proj
+        heads.time_mlp_in = model_to_save.model.time_mlp_in
+        heads.time_mlp_out = model_to_save.model.time_mlp_out
+        save_model_as_safetensor(heads, str(save_directory / "pi05_heads.safetensors"))
 
         if self.config.use_lora:
             # Save LoRA params and config under "lora"
